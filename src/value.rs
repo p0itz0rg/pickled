@@ -6,19 +6,28 @@
 
 //! Python values, and serialization instances for them.
 
-use num_bigint::{BigInt, Sign};
-use num_traits::{Float, Signed, ToPrimitive};
+use num_bigint::BigInt;
+use num_bigint::Sign;
+use num_traits::Float;
+use num_traits::Signed;
+use num_traits::ToPrimitive;
 use std::borrow::Cow;
-use std::cell::{Ref, RefCell, RefMut};
+use std::cell::Ref;
+use std::cell::RefCell;
+use std::cell::RefMut;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering as AtomicOrdering;
 
-pub use crate::value_impls::{from_value, to_value};
+pub use crate::value_impls::from_value;
+pub use crate::value_impls::to_value;
 
-use crate::error::{Error, ErrorCode};
+use crate::error::Error;
+use crate::error::ErrorCode;
 use crate::object::PickleObject;
 
 static NEXT_SHARED_ID: AtomicU64 = AtomicU64::new(0);
@@ -390,7 +399,10 @@ impl Value {
             Value::Tuple(v) => v.inner().iter().any(|v| v.contains_nan()),
             Value::Set(v) => v.inner().iter().any(|v| v.contains_nan()),
             Value::FrozenSet(v) => v.inner().iter().any(|v| v.contains_nan()),
-            Value::Dict(v) => v.inner().iter().any(|(k, v)| k.contains_nan() || v.contains_nan()),
+            Value::Dict(v) => v
+                .inner()
+                .iter()
+                .any(|(k, v)| k.contains_nan() || v.contains_nan()),
             _ => false,
         }
     }
@@ -706,16 +718,21 @@ fn total_float_ord(f: f64, g: f64) -> Ordering {
 fn float_bigint_ord(bi: &BigInt, f: f64) -> Ordering {
     // If f is NaN or infinity, the int's magnitude is irrelevant.
     if !f.is_finite() {
-        return if f.is_nan() {
-            Ordering::Less // NaN sorts after everything
-        } else if f > 0.0 {
-            Ordering::Less // int < +inf
+        // int < +inf, int < NaN, int > -inf
+        return if f < 0.0 {
+            Ordering::Greater
         } else {
-            Ordering::Greater // int > -inf
+            Ordering::Less
         };
     }
 
-    let fsign: i32 = if f == 0.0 { 0 } else if f < 0.0 { -1 } else { 1 };
+    let fsign: i32 = if f == 0.0 {
+        0
+    } else if f < 0.0 {
+        -1
+    } else {
+        1
+    };
     let isign: i32 = match bi.sign() {
         Sign::Minus => -1,
         Sign::Plus => 1,

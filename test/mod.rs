@@ -38,12 +38,19 @@ macro_rules! hpyobj {
 }
 
 mod struct_tests {
-    use crate::{
-        HashableValue, SerOptions, Value, from_slice, from_value, to_value, to_vec,
-        value_from_slice, value_to_vec,
-    };
-    use serde::{de, ser};
-    use serde_derive::{Deserialize, Serialize};
+    use crate::HashableValue;
+    use crate::SerOptions;
+    use crate::Value;
+    use crate::from_slice;
+    use crate::from_value;
+    use crate::to_value;
+    use crate::to_vec;
+    use crate::value_from_slice;
+    use crate::value_to_vec;
+    use serde::de;
+    use serde::ser;
+    use serde_derive::Deserialize;
+    use serde_derive::Serialize;
     use std::collections::BTreeMap;
     use std::fmt;
     use std::iter::FromIterator;
@@ -300,15 +307,27 @@ mod struct_tests {
 }
 
 mod value_tests {
+    use crate::DeOptions;
     use crate::Deserializer;
-    use crate::error::{Error, ErrorCode};
-    use crate::object::{DictObject, PickleObject};
-    use crate::{DeOptions, HashableValue, SerOptions, Value};
-    use crate::{from_slice, to_vec, value_from_reader, value_from_slice, value_to_vec};
+    use crate::HashableValue;
+    use crate::SerOptions;
+    use crate::Value;
+    use crate::error::Error;
+    use crate::error::ErrorCode;
+    use crate::from_slice;
+    use crate::object::DictObject;
+    use crate::object::PickleObject;
+    use crate::to_vec;
+    use crate::value_from_reader;
+    use crate::value_from_slice;
+    use crate::value_to_vec;
     use num_bigint::BigInt;
-    use quickcheck::{Gen, QuickCheck};
-    use rand::{RngCore, rng};
-    use std::collections::{BTreeMap, BTreeSet};
+    use quickcheck::Gen;
+    use quickcheck::QuickCheck;
+    use rand::RngCore;
+    use rand::rng;
+    use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
     use std::fs::File;
     use std::iter::FromIterator;
 
@@ -525,14 +544,12 @@ mod value_tests {
     #[test]
     fn simple_class_as_dict_object() {
         for proto in 2..=5 {
-            let data = std::fs::read(format!(
-                "test/data/test_simple_class_proto{proto}.pickle"
-            ))
-            .unwrap();
+            let data =
+                std::fs::read(format!("test/data/test_simple_class_proto{proto}.pickle")).unwrap();
             let val = value_from_slice(&data, Default::default()).unwrap();
-            let obj = val.object_ref().unwrap_or_else(|| {
-                panic!("proto {proto}: expected Object, got {val:?}")
-            });
+            let obj = val
+                .object_ref()
+                .unwrap_or_else(|| panic!("proto {proto}: expected Object, got {val:?}"));
             let (module, class) = obj.class_info();
             assert_eq!(module, "__main__");
             assert_eq!(class, "SimpleClass");
@@ -556,10 +573,8 @@ mod value_tests {
 
         // Proto < 2 needs replace_reconstructor to produce Objects.
         for proto in 0..2 {
-            let data = std::fs::read(format!(
-                "test/data/test_simple_class_proto{proto}.pickle"
-            ))
-            .unwrap();
+            let data =
+                std::fs::read(format!("test/data/test_simple_class_proto{proto}.pickle")).unwrap();
             let opts = DeOptions::new().replace_reconstructor_objects_structures();
             let val = value_from_slice(&data, opts).unwrap();
             let obj = val.object_ref().unwrap_or_else(|| {
@@ -581,10 +596,8 @@ mod value_tests {
     #[test]
     fn slotted_class_as_dict_object() {
         for proto in 2..=5 {
-            let data = std::fs::read(format!(
-                "test/data/test_slotted_class_proto{proto}.pickle"
-            ))
-            .unwrap();
+            let data =
+                std::fs::read(format!("test/data/test_slotted_class_proto{proto}.pickle")).unwrap();
             let val = value_from_slice(&data, Default::default()).unwrap();
             let obj = val.object_ref().expect("expected Object");
             let dict_obj = obj
@@ -608,10 +621,8 @@ mod value_tests {
     #[test]
     fn nested_class_as_dict_object() {
         for proto in 2..=5 {
-            let data = std::fs::read(format!(
-                "test/data/test_nested_class_proto{proto}.pickle"
-            ))
-            .unwrap();
+            let data =
+                std::fs::read(format!("test/data/test_nested_class_proto{proto}.pickle")).unwrap();
             let val = value_from_slice(&data, Default::default()).unwrap();
             let outer = val.object_ref().expect("expected Object");
             let outer_dict = outer
@@ -643,10 +654,8 @@ mod value_tests {
     #[test]
     fn empty_class_as_dict_object() {
         for proto in 2..=5 {
-            let data = std::fs::read(format!(
-                "test/data/test_empty_class_proto{proto}.pickle"
-            ))
-            .unwrap();
+            let data =
+                std::fs::read(format!("test/data/test_empty_class_proto{proto}.pickle")).unwrap();
             let val = value_from_slice(&data, Default::default()).unwrap();
             let obj = val.object_ref().expect("expected Object");
             let dict_obj = obj
@@ -696,14 +705,11 @@ mod value_tests {
                 }
             }
             fn eq_dyn(&self, other: &dyn PickleObject) -> bool {
-                other
-                    .as_any()
-                    .downcast_ref::<Self>()
-                    .is_some_and(|o| {
-                        self.module == o.module
-                            && self.class == o.class
-                            && self.state_value == o.state_value
-                    })
+                other.as_any().downcast_ref::<Self>().is_some_and(|o| {
+                    self.module == o.module
+                        && self.class == o.class
+                        && self.state_value == o.state_value
+                })
             }
             fn cmp_dyn(&self, other: &dyn PickleObject) -> std::cmp::Ordering {
                 self.class_info().cmp(&other.class_info())
@@ -728,10 +734,8 @@ mod value_tests {
             }
         });
 
-        let data =
-            std::fs::read("test/data/test_simple_class_proto4.pickle").unwrap();
-        let val =
-            value_from_slice(&data, DeOptions::new().object_factory(factory)).unwrap();
+        let data = std::fs::read("test/data/test_simple_class_proto4.pickle").unwrap();
+        let val = value_from_slice(&data, DeOptions::new().object_factory(factory)).unwrap();
         let obj = val.object_ref().expect("expected Object");
         assert!(
             obj.as_any().downcast_ref::<CustomObj>().is_some(),
@@ -755,10 +759,8 @@ mod value_tests {
                 None
             }
         });
-        let data =
-            std::fs::read("test/data/test_nested_class_proto4.pickle").unwrap();
-        let val =
-            value_from_slice(&data, DeOptions::new().object_factory(factory2)).unwrap();
+        let data = std::fs::read("test/data/test_nested_class_proto4.pickle").unwrap();
+        let val = value_from_slice(&data, DeOptions::new().object_factory(factory2)).unwrap();
         let obj = val.object_ref().expect("expected Object");
         let custom = obj.as_any().downcast_ref::<CustomObj>().unwrap();
         if let Some(state) = &custom.state_value {
@@ -781,11 +783,17 @@ mod value_tests {
         let two_53_f = (1u64 << 53) as f64;
 
         // 2^53 is exactly representable as f64
-        assert_eq!(HashableValue::Int(two_53.clone()), HashableValue::F64(two_53_f));
+        assert_eq!(
+            HashableValue::Int(two_53.clone()),
+            HashableValue::F64(two_53_f)
+        );
 
         // 2^53 + 1 loses precision in f64; the int is strictly greater
         let two_53_plus_1 = &two_53 + BigInt::from(1);
-        assert_ne!(HashableValue::Int(two_53_plus_1.clone()), HashableValue::F64(two_53_f));
+        assert_ne!(
+            HashableValue::Int(two_53_plus_1.clone()),
+            HashableValue::F64(two_53_f)
+        );
         assert!(HashableValue::Int(two_53_plus_1) > HashableValue::F64(two_53_f));
 
         let huge = BigInt::from(2).pow(100);

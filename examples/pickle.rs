@@ -10,7 +10,9 @@
 use std::env;
 use std::error::Error;
 use std::fs::File;
-use std::io::{Read, stdin, stdout};
+use std::io::Read;
+use std::io::stdin;
+use std::io::stdout;
 use std::process::exit;
 
 use pickled as pickle;

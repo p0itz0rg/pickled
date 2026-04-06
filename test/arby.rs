@@ -6,10 +6,14 @@
 
 //! QuickCheck Arbitrary instance for Value, and associated helpers.
 
-use crate::value::{Shared, SharedFrozen};
-use crate::{HashableValue, Value};
+use crate::HashableValue;
+use crate::Value;
+use crate::value::Shared;
+use crate::value::SharedFrozen;
 use num_bigint::BigInt;
-use quickcheck::{Arbitrary, Gen, empty_shrinker};
+use quickcheck::Arbitrary;
+use quickcheck::Gen;
+use quickcheck::empty_shrinker;
 use std::ops::Range;
 
 const MAX_DEPTH: u32 = 1;

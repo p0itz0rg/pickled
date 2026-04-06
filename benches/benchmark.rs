@@ -1,7 +1,11 @@
 #![cfg(feature = "criterion-bench")]
 
-use byteorder::{LittleEndian, WriteBytesExt};
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use byteorder::LittleEndian;
+use byteorder::WriteBytesExt;
+use criterion::Criterion;
+use criterion::black_box;
+use criterion::criterion_group;
+use criterion::criterion_main;
 use pickled;
 use pickled::*;
 use std::collections::BTreeMap;

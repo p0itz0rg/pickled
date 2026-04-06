@@ -10,30 +10,44 @@
 //! order to deserialize a pickle stream to `value::Value`, use the
 //! `value_from_*` functions exported here, not the generic `from_*` functions.
 
-use byteorder::{BigEndian, ByteOrder, LittleEndian};
-use iter_read::{IterRead, IterReadItem};
-use num_bigint::{BigInt, Sign};
+use byteorder::BigEndian;
+use byteorder::ByteOrder;
+use byteorder::LittleEndian;
+use iter_read::IterRead;
+use iter_read::IterReadItem;
+use num_bigint::BigInt;
+use num_bigint::Sign;
 use num_traits::ToPrimitive;
+use serde::de;
 use serde::de::Visitor;
-use serde::{de, forward_to_deserialize_any};
+use serde::forward_to_deserialize_any;
 use std::borrow::Cow;
 use std::char;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fmt;
 use std::io;
-use std::io::{BufRead, BufReader, Read};
+use std::io::BufRead;
+use std::io::BufReader;
+use std::io::Read;
 use std::iter::FusedIterator;
 use std::mem;
 use std::str;
 use std::str::FromStr;
 use std::vec;
 
-use crate::object::{DictObject, ObjectFactory, PickleObject};
-use crate::value::{RawHashableValue, Shared, SharedFrozen};
+use crate::object::DictObject;
+use crate::object::ObjectFactory;
+use crate::object::PickleObject;
+use crate::value::RawHashableValue;
+use crate::value::Shared;
+use crate::value::SharedFrozen;
 
 use super::consts::*;
-use super::error::{Error, ErrorCode, Result};
+use super::error::Error;
+use super::error::ErrorCode;
+use super::error::Result;
 use super::value;
 
 const MEMO_REF_COUNTING: bool = false;
@@ -214,10 +228,10 @@ pub struct Deserializer<R: Read> {
     rdr: BufReader<R>,
     options: DeOptions,
     pos: usize,
-    value: Option<Value>,                       // next value to deserialize
-    memo: BTreeMap<MemoId, (Value, i32)>,       // pickle memo (value, number of refs)
-    stack: Vec<Value>,                          // topmost items on the stack
-    stacks: Vec<Vec<Value>>,                    // items further down the stack, between MARKs
+    value: Option<Value>,                     // next value to deserialize
+    memo: BTreeMap<MemoId, (Value, i32)>,     // pickle memo (value, number of refs)
+    stack: Vec<Value>,                        // topmost items on the stack
+    stacks: Vec<Vec<Value>>,                  // items further down the stack, between MARKs
     converted_rc: HashMap<u64, value::Value>, // shared items that have already been converted
     strings_rc: HashMap<Vec<u8>, Value>,
     tuple_rc: BTreeMap<Vec<value::RawHashableValue>, Value>,

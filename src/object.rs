@@ -5,8 +5,12 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::error::{Error, ErrorCode};
-use crate::value::{HashableValue, Shared, SharedFrozen, Value};
+use crate::error::Error;
+use crate::error::ErrorCode;
+use crate::value::HashableValue;
+use crate::value::Shared;
+use crate::value::SharedFrozen;
+use crate::value::Value;
 
 /// Result of `__reduce__` — describes how to serialize/reconstruct a Python object.
 ///

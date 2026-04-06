@@ -68,17 +68,34 @@
 //!
 //! The minimum supported version of the toolchain is 1.41.1.
 
-pub use self::ser::{SerOptions, Serializer, to_vec, to_writer, value_to_vec, value_to_writer};
+pub use self::ser::SerOptions;
+pub use self::ser::Serializer;
+pub use self::ser::to_vec;
+pub use self::ser::to_writer;
+pub use self::ser::value_to_vec;
+pub use self::ser::value_to_writer;
 
-pub use self::de::{
-    DeOptions, Deserializer, from_iter, from_reader, from_slice, value_from_iter,
-    value_from_reader, value_from_slice,
-};
+pub use self::de::DeOptions;
+pub use self::de::Deserializer;
+pub use self::de::from_iter;
+pub use self::de::from_reader;
+pub use self::de::from_slice;
+pub use self::de::value_from_iter;
+pub use self::de::value_from_reader;
+pub use self::de::value_from_slice;
 
-pub use self::value::{HashableValue, Value, from_value, to_value};
+pub use self::value::HashableValue;
+pub use self::value::Value;
+pub use self::value::from_value;
+pub use self::value::to_value;
 
-pub use self::error::{Error, ErrorCode, Result};
-pub use self::object::{ObjectConstructionInfo, ObjectFactory, PickleObject, ReduceResult};
+pub use self::error::Error;
+pub use self::error::ErrorCode;
+pub use self::error::Result;
+pub use self::object::ObjectConstructionInfo;
+pub use self::object::ObjectFactory;
+pub use self::object::PickleObject;
+pub use self::object::ReduceResult;
 pub use num_bigint;
 pub use num_traits;
 

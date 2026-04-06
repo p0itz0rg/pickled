@@ -6,7 +6,8 @@
 
 //! Error objects and codes
 
-use serde::{de, ser};
+use serde::de;
+use serde::ser;
 use std::error;
 use std::fmt;
 use std::io;

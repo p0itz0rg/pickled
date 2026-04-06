@@ -6,7 +6,9 @@
 
 //! Pickle serialization
 
-use byteorder::{BigEndian, LittleEndian, WriteBytesExt};
+use byteorder::BigEndian;
+use byteorder::LittleEndian;
+use byteorder::WriteBytesExt;
 use num_bigint::BigInt;
 use num_traits::Signed;
 use num_traits::ToPrimitive;
@@ -18,8 +20,10 @@ use std::collections::BTreeSet;
 use std::io;
 
 use super::consts::*;
-use super::error::{Error, Result};
-use super::value::{HashableValue, Value};
+use super::error::Error;
+use super::error::Result;
+use super::value::HashableValue;
+use super::value::Value;
 
 /// Supported pickle protocols for writing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
