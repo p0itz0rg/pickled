@@ -896,4 +896,39 @@ mod value_tests {
         let val = value_from_slice(&data, Default::default()).unwrap();
         assert_eq!(val.dict_ref().unwrap().inner().len(), 1);
     }
+
+    #[test]
+    fn bigint_normalized_to_i64() {
+        // BigInts that fit in i64 should be deserialized as I64, including
+        // inside object state (de_value_to_public_value path).
+        for proto in 2..=5 {
+            let data = std::fs::read(format!(
+                "test/data/test_bigint_normalization_proto{proto}.pickle"
+            ))
+            .unwrap();
+            let val = value_from_slice(&data, Default::default()).unwrap();
+            let obj = val.object_ref().expect("expected Object");
+            let dict_obj = obj
+                .as_any()
+                .downcast_ref::<DictObject>()
+                .expect("expected DictObject");
+            let state = dict_obj.state();
+
+            assert_eq!(
+                state.get(&hpyobj!(s = "small")),
+                Some(&pyobj!(i = 42)),
+                "proto {proto}: small int"
+            );
+            // 2^62 fits in i64, should be normalized from Int to I64
+            assert!(
+                matches!(state.get(&hpyobj!(s = "fits_i64")), Some(Value::I64(_))),
+                "proto {proto}: 2^62 should be I64"
+            );
+            // 2^100 does not fit, should stay as Int
+            assert!(
+                matches!(state.get(&hpyobj!(s = "big")), Some(Value::Int(_))),
+                "proto {proto}: 2^100 should be Int"
+            );
+        }
+    }
 }

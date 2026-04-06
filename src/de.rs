@@ -1188,7 +1188,13 @@ impl<R: Read> Deserializer<R> {
             Value::None => value::Value::None,
             Value::Bool(b) => value::Value::Bool(b),
             Value::I64(i) => value::Value::I64(i),
-            Value::Int(i) => value::Value::Int(i),
+            Value::Int(i) => {
+                if let Some(i) = i.to_i64() {
+                    value::Value::I64(i)
+                } else {
+                    value::Value::Int(i)
+                }
+            }
             Value::F64(f) => value::Value::F64(f),
             Value::Bytes(b) => value::Value::Bytes(b),
             Value::String(s) => value::Value::String(s),

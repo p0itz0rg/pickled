@@ -131,4 +131,14 @@ d[1.0] = "float"
 d[True] = "bool"
 write_single("test_dict_numeric_keys", d)
 
+
+class SmallIntClass:
+    def __init__(self):
+        self.small = 42
+        self.fits_i64 = 2**62
+        self.big = 2**100
+
+for proto in range(MAX_PROTO + 1):
+    write("test_bigint_normalization", SmallIntClass(), proto)
+
 print(f"wrote to {os.path.abspath(OUT)}")
