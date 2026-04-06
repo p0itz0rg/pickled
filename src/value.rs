@@ -18,6 +18,7 @@ use std::rc::Rc;
 pub use crate::value_impls::{from_value, to_value};
 
 use crate::error::{Error, ErrorCode};
+use crate::object::PickleObject;
 
 #[derive(Debug, Eq, PartialOrd, Ord, Clone)]
 pub struct Shared<T>(Rc<RefCell<T>>);
@@ -161,7 +162,7 @@ where
 /// all integers are long integers, so all are pickled as such.  While decoding,
 /// we simply put all integers that fit into an i64, and use `BigInt` for the
 /// rest.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 #[cfg_attr(feature = "variantly", derive(variantly::Variantly))]
 pub enum Value {
     /// None
@@ -188,6 +189,49 @@ pub enum Value {
     FrozenSet(SharedFrozen<BTreeSet<HashableValue>>),
     /// Dictionary (map)
     Dict(Shared<BTreeMap<HashableValue, Value>>),
+    /// Python object reconstructed during unpickling
+    Object(Box<dyn PickleObject>),
+}
+
+impl Clone for Value {
+    fn clone(&self) -> Self {
+        match self {
+            Value::None => Value::None,
+            Value::Bool(b) => Value::Bool(*b),
+            Value::I64(i) => Value::I64(*i),
+            Value::Int(i) => Value::Int(i.clone()),
+            Value::F64(f) => Value::F64(*f),
+            Value::Bytes(b) => Value::Bytes(b.clone()),
+            Value::String(s) => Value::String(s.clone()),
+            Value::List(l) => Value::List(l.clone()),
+            Value::Tuple(t) => Value::Tuple(t.clone()),
+            Value::Set(s) => Value::Set(s.clone()),
+            Value::FrozenSet(s) => Value::FrozenSet(s.clone()),
+            Value::Dict(d) => Value::Dict(d.clone()),
+            Value::Object(o) => Value::Object(o.clone_dyn()),
+        }
+    }
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::None, Value::None) => true,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::I64(a), Value::I64(b)) => a == b,
+            (Value::Int(a), Value::Int(b)) => a == b,
+            (Value::F64(a), Value::F64(b)) => a == b,
+            (Value::Bytes(a), Value::Bytes(b)) => a == b,
+            (Value::String(a), Value::String(b)) => a == b,
+            (Value::List(a), Value::List(b)) => a == b,
+            (Value::Tuple(a), Value::Tuple(b)) => a == b,
+            (Value::Set(a), Value::Set(b)) => a == b,
+            (Value::FrozenSet(a), Value::FrozenSet(b)) => a == b,
+            (Value::Dict(a), Value::Dict(b)) => a == b,
+            (Value::Object(a), Value::Object(b)) => a.eq_dyn(b.as_ref()),
+            _ => false,
+        }
+    }
 }
 
 /// Represents all primitive builtin Python values that can be contained
@@ -268,6 +312,7 @@ impl Value {
             Value::String(s) => Ok(HashableValue::String(s)),
             Value::FrozenSet(v) => Ok(HashableValue::FrozenSet(v)),
             Value::Tuple(v) => values_to_hashable(v).map(HashableValue::Tuple),
+            Value::Object(o) => o.__hash__(),
             _ => Err(Error::Syntax(ErrorCode::ValueNotHashable)),
         }
     }
@@ -292,6 +337,7 @@ impl Value {
                 Ok(RawHashableValue::FrozenSet(SharedFrozen::new(new)))
             }
             Value::Tuple(v) => values_to_raw_hashable(v).map(RawHashableValue::Tuple),
+            Value::Object(o) => o.__hash__()?.into_value().into_raw_hashable(),
             _ => Err(Error::Syntax(ErrorCode::ValueNotHashable)),
         }
     }
@@ -404,6 +450,7 @@ impl fmt::Display for Value {
                 }
                 write!(f, "}}")
             }
+            Value::Object(ref o) => write!(f, "{o}"),
         }
     }
 }

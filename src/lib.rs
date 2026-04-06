@@ -78,12 +78,14 @@ pub use self::de::{
 pub use self::value::{HashableValue, Value, from_value, to_value};
 
 pub use self::error::{Error, ErrorCode, Result};
+pub use self::object::{ObjectConstructionInfo, ObjectFactory, PickleObject, ReduceResult};
 pub use num_bigint;
 pub use num_traits;
 
 mod consts;
 pub mod de;
 pub mod error;
+pub mod object;
 pub mod ser;
 pub mod value;
 mod value_impls;

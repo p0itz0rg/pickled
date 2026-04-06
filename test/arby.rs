@@ -132,6 +132,7 @@ impl Arbitrary for Value {
             Value::Dict(ref v) => {
                 Box::new(Arbitrary::shrink(&*v.inner()).map(|x| Value::Dict(Shared::new(x))))
             }
+            Value::Object(_) => empty_shrinker(),
         }
     }
 }

@@ -302,6 +302,7 @@ mod struct_tests {
 mod value_tests {
     use crate::Deserializer;
     use crate::error::{Error, ErrorCode};
+    use crate::object::{DictObject, PickleObject};
     use crate::{DeOptions, HashableValue, SerOptions, Value};
     use crate::{from_slice, to_vec, value_from_reader, value_from_slice, value_to_vec};
     use num_bigint::BigInt;
@@ -324,7 +325,7 @@ mod value_tests {
         (3, 5),
     ];
 
-    fn get_test_object(pyver: u32) -> Value {
+    fn get_test_object(pyver: u32, proto: u32) -> Value {
         // Reproduces the test_object from test/data/generate.py.
         let longish = BigInt::from(10000000000u64) * BigInt::from(10000000000u64);
         let mut obj = pyobj!(d={
@@ -344,15 +345,29 @@ mod value_tests {
                 bb=b"\x00\x55\xaa\xff"
             ]
         });
-        // Unfortunately, __dict__ keys are strings and so are pickled
-        // differently depending on major version.
+        // For protocols that use NEWOBJ (proto >= 2), class instances are
+        // deserialized as Objects. For older protocols that use
+        // _reconstructor via REDUCE, BUILD replaces the standin with the
+        // state dict directly.
+        let uses_newobj = proto >= 2;
         match &mut obj {
             Value::Dict(map) => {
                 let mut map = map.inner_mut();
-                if pyver == 2 {
-                    map.insert(hpyobj!(i = 7), pyobj!(d={bb=b"attr" => i=5}));
+                if uses_newobj {
+                    let mut class_obj = DictObject::new("__main__".into(), "Class".into());
+                    if pyver == 2 {
+                        class_obj.__setstate__(pyobj!(d={bb=b"attr" => i=5}));
+                    } else {
+                        class_obj.__setstate__(pyobj!(d={s="attr" => i=5}));
+                    }
+                    map.insert(hpyobj!(i = 7), Value::Object(Box::new(class_obj)));
                 } else {
-                    map.insert(hpyobj!(i = 7), pyobj!(d={s="attr" => i=5}));
+                    // _reconstructor path: BUILD replaces standin with state dict
+                    if pyver == 2 {
+                        map.insert(hpyobj!(i = 7), pyobj!(d={bb=b"attr" => i=5}));
+                    } else {
+                        map.insert(hpyobj!(i = 7), pyobj!(d={s="attr" => i=5}));
+                    }
                 }
             }
             _ => unreachable!(),
@@ -365,7 +380,7 @@ mod value_tests {
         for &(major, proto) in TEST_CASES {
             let file =
                 File::open(format!("test/data/tests_py{}_proto{}.pickle", major, proto)).unwrap();
-            let comparison = get_test_object(major);
+            let comparison = get_test_object(major, proto);
             let unpickled = value_from_reader(file, Default::default()).unwrap();
             assert_eq!(unpickled, comparison, "py {}, proto {}", major, proto);
         }
@@ -373,7 +388,8 @@ mod value_tests {
 
     #[test]
     fn roundtrip() {
-        let dict = get_test_object(2);
+        // Use proto 0 (no NEWOBJ) so the test object has no Object variants.
+        let dict = get_test_object(2, 0);
         let vec: Vec<_> = value_to_vec(&dict, Default::default()).unwrap();
         let tripped = value_from_slice(&vec, Default::default()).unwrap();
         assert_eq!(dict, tripped);

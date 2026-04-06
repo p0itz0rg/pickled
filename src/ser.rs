@@ -22,16 +22,11 @@ use super::error::{Error, Result};
 use super::value::{HashableValue, Value};
 
 /// Supported pickle protocols for writing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum PickleProto {
     V2,
+    #[default]
     V3,
-}
-
-impl Default for PickleProto {
-    fn default() -> Self {
-        Self::V3
-    }
 }
 
 /// Options for serializing.
@@ -159,6 +154,7 @@ impl<W: io::Write> Serializer<W> {
             }
             Value::Set(ref s) => self.serialize_set(&s.inner(), b"set"),
             Value::FrozenSet(ref s) => self.serialize_set(s.inner(), b"frozenset"),
+            Value::Object(ref o) => self.serialize_object(o.as_ref()),
         }
     }
 
@@ -240,6 +236,52 @@ impl<W: io::Write> Serializer<W> {
         self.write_opcode(Opcode::Appends)?;
         self.write_opcode(Opcode::Tuple1)?;
         self.write_opcode(Opcode::Reduce)
+    }
+
+    fn serialize_object(&mut self, obj: &dyn crate::object::PickleObject) -> Result<()> {
+        let reduce = obj.__reduce__();
+
+        // Emit: GLOBAL module\nclass\n
+        self.write_opcode(Opcode::Global)?;
+        self.writer.write_all(reduce.module.as_bytes())?;
+        self.writer.write_all(b"\n")?;
+        self.writer.write_all(reduce.class.as_bytes())?;
+        self.writer.write_all(b"\n")?;
+
+        // Emit args + NEWOBJ
+        self.serialize_value(&reduce.args)?;
+        self.write_opcode(Opcode::NewObj)?;
+
+        // Emit list items via APPENDS
+        if let Some(ref items) = reduce.list_items
+            && !items.is_empty()
+        {
+            self.write_opcode(Opcode::Mark)?;
+            for item in items {
+                self.serialize_value(item)?;
+            }
+            self.write_opcode(Opcode::Appends)?;
+        }
+
+        // Emit dict items via SETITEMS
+        if let Some(ref items) = reduce.dict_items
+            && !items.is_empty()
+        {
+            self.write_opcode(Opcode::Mark)?;
+            for (key, value) in items {
+                self.serialize_hashable_value(key)?;
+                self.serialize_value(value)?;
+            }
+            self.write_opcode(Opcode::SetItems)?;
+        }
+
+        // Emit state + BUILD
+        if let Some(ref state) = reduce.state {
+            self.serialize_value(state)?;
+            self.write_opcode(Opcode::Build)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -876,6 +918,7 @@ impl Serialize for Value {
                 }
                 map.end()
             }
+            Value::Object(ref o) => o.__reduce__().state_or_none().serialize(serializer),
         }
     }
 }

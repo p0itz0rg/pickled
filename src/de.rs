@@ -20,6 +20,7 @@ use std::borrow::Cow;
 use std::char;
 use std::collections::{BTreeMap, HashMap};
 use std::convert::TryFrom;
+use std::fmt;
 use std::io;
 use std::io::{BufRead, BufReader, Read};
 use std::iter::FusedIterator;
@@ -28,6 +29,7 @@ use std::str;
 use std::str::FromStr;
 use std::vec;
 
+use crate::object::{DictObject, ObjectFactory, PickleObject};
 use crate::value::{RawHashableValue, Shared, SharedFrozen};
 
 use super::consts::*;
@@ -63,7 +65,7 @@ enum Global {
 /// We also don't use sets and maps at the Rust level, since they are not
 /// needed: nothing is ever looked up in them at this stage, and Vecs are much
 /// tighter in memory.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 enum Value {
     MemoRef(MemoId),
     Global(Global),
@@ -79,15 +81,88 @@ enum Value {
     Set(Shared<Vec<Value>>),
     FrozenSet(SharedFrozen<Vec<Value>>),
     Dict(Shared<Vec<(Value, Value)>>),
+    Object(Box<dyn PickleObject>),
 }
 
+impl Clone for Value {
+    fn clone(&self) -> Self {
+        match self {
+            Value::MemoRef(id) => Value::MemoRef(*id),
+            Value::Global(g) => Value::Global(g.clone()),
+            Value::None => Value::None,
+            Value::Bool(b) => Value::Bool(*b),
+            Value::I64(i) => Value::I64(*i),
+            Value::Int(i) => Value::Int(i.clone()),
+            Value::F64(f) => Value::F64(*f),
+            Value::Bytes(b) => Value::Bytes(b.clone()),
+            Value::String(s) => Value::String(s.clone()),
+            Value::List(l) => Value::List(l.clone()),
+            Value::Tuple(t) => Value::Tuple(t.clone()),
+            Value::Set(s) => Value::Set(s.clone()),
+            Value::FrozenSet(s) => Value::FrozenSet(s.clone()),
+            Value::Dict(d) => Value::Dict(d.clone()),
+            Value::Object(o) => Value::Object(o.clone_dyn()),
+        }
+    }
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::MemoRef(a), Value::MemoRef(b)) => a == b,
+            (Value::Global(a), Value::Global(b)) => a == b,
+            (Value::None, Value::None) => true,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::I64(a), Value::I64(b)) => a == b,
+            (Value::Int(a), Value::Int(b)) => a == b,
+            (Value::F64(a), Value::F64(b)) => a == b,
+            (Value::Bytes(a), Value::Bytes(b)) => a == b,
+            (Value::String(a), Value::String(b)) => a == b,
+            (Value::List(a), Value::List(b)) => a == b,
+            (Value::Tuple(a), Value::Tuple(b)) => a == b,
+            (Value::Set(a), Value::Set(b)) => a == b,
+            (Value::FrozenSet(a), Value::FrozenSet(b)) => a == b,
+            (Value::Dict(a), Value::Dict(b)) => a == b,
+            (Value::Object(a), Value::Object(b)) => a.eq_dyn(b.as_ref()),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Value {}
+
 /// Options for deserializing.
-#[derive(Clone, Debug, Default)]
+#[derive(Default)]
 pub struct DeOptions {
     decode_strings: bool,
     replace_unresolved_globals: bool,
     replace_recursive_structures: bool,
     replace_reconstructor_objects_with_dict: bool,
+    object_factory: Option<ObjectFactory>,
+}
+
+impl fmt::Debug for DeOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeOptions")
+            .field("decode_strings", &self.decode_strings)
+            .field(
+                "replace_unresolved_globals",
+                &self.replace_unresolved_globals,
+            )
+            .field(
+                "replace_recursive_structures",
+                &self.replace_recursive_structures,
+            )
+            .field(
+                "replace_reconstructor_objects_with_dict",
+                &self.replace_reconstructor_objects_with_dict,
+            )
+            .field(
+                "object_factory",
+                &self.object_factory.as_ref().map(|_| "..."),
+            )
+            .finish()
+    }
 }
 
 impl DeOptions {
@@ -117,9 +192,19 @@ impl DeOptions {
         self
     }
 
-    /// Activate replacing recursive structures by with a best-attempt dictionary, instead of erroring out.
+    /// Activate replacing reconstructor objects with a best-attempt dictionary, instead of erroring out.
     pub fn replace_reconstructor_objects_structures(mut self) -> Self {
         self.replace_reconstructor_objects_with_dict = true;
+        self
+    }
+
+    /// Set a custom object factory for constructing Python objects during deserialization.
+    ///
+    /// The factory receives an `ObjectConstructionInfo` with the module and class name,
+    /// and should return `Some(object)` for classes it handles, or `None` to fall back
+    /// to the default `DictObject` behavior.
+    pub fn object_factory(mut self, factory: ObjectFactory) -> Self {
+        self.object_factory = Some(factory);
         self
     }
 }
@@ -561,48 +646,99 @@ impl<R: Read> Deserializer<R> {
 
                 // Arbitrary classes - make a best effort attempt to recover some data
                 Opcode::Inst => {
-                    // pop module name and class name
-                    for _ in 0..2 {
-                        self.read_line()?;
-                    }
-                    // pop arguments to init
-                    self.pop_mark()?;
-                    // push empty dictionary instead of the class instance
-                    self.stack.push(Value::Dict(Shared::new(Vec::new())));
+                    let modname = self.read_line()?;
+                    let globname = self.read_line()?;
+                    let _args = self.pop_mark()?;
+                    let modname = String::from_utf8(modname)
+                        .map_err(|_| self.inner_error(ErrorCode::StringNotUTF8))?;
+                    let globname = String::from_utf8(globname)
+                        .map_err(|_| self.inner_error(ErrorCode::StringNotUTF8))?;
+                    let obj = self.make_object(&modname, &globname);
+                    self.stack.push(obj);
                 }
                 Opcode::Obj => {
-                    // pop arguments to init
-                    self.pop_mark()?;
-                    // pop class object
-                    self.pop()?;
-                    self.stack.push(Value::Dict(Shared::new(Vec::new())));
+                    let mut args = self.pop_mark()?;
+                    let cls = if args.is_empty() {
+                        self.pop()?
+                    } else {
+                        args.remove(0)
+                    };
+                    let cls = self.resolve(Some(cls));
+                    let (modname, globname) = match &cls {
+                        Some(Value::Global(Global::Other { modname, globname })) => {
+                            (modname.as_ref(), globname.as_ref())
+                        }
+                        _ => {
+                            return Self::stack_error(
+                                "global reference",
+                                cls.as_ref().unwrap_or(&Value::None),
+                                self.pos,
+                            );
+                        }
+                    };
+                    let obj = self.make_object(modname, globname);
+                    self.stack.push(obj);
                 }
                 Opcode::NewObj => {
-                    // pop arguments and class object
-                    for _ in 0..2 {
-                        self.pop()?;
-                    }
-                    self.stack.push(Value::Dict(Shared::new(Vec::new())));
+                    let _args = self.pop()?;
+                    let cls = self.pop_resolve()?;
+                    let (modname, globname) = match &cls {
+                        Value::Global(Global::Other { modname, globname }) => {
+                            (modname.as_ref(), globname.as_ref())
+                        }
+                        _ => return Self::stack_error("global reference", &cls, self.pos),
+                    };
+                    let obj = self.make_object(modname, globname);
+                    self.stack.push(obj);
                 }
                 Opcode::NewObjEx => {
-                    // pop keyword args, arguments and class object
-                    for _ in 0..3 {
-                        self.pop()?;
-                    }
-                    self.stack.push(Value::Dict(Shared::new(Vec::new())));
+                    let _kwargs = self.pop()?;
+                    let _args = self.pop()?;
+                    let cls = self.pop_resolve()?;
+                    let (modname, globname) = match &cls {
+                        Value::Global(Global::Other { modname, globname }) => {
+                            (modname.as_ref(), globname.as_ref())
+                        }
+                        _ => return Self::stack_error("global reference", &cls, self.pos),
+                    };
+                    let obj = self.make_object(modname, globname);
+                    self.stack.push(obj);
                 }
                 Opcode::Build => {
-                    // The top-of-stack for BUILD is used either as the instance __dict__,
-                    // or an argument for __setstate__, in which case it can be *any* type
-                    // of object.  In both cases, we just replace the standin.
                     let state = self.pop()?;
-                    let obj = self.pop()?; // remove the object standin
+                    let obj = self.pop()?;
 
                     let _standin = self.resolve(Some(obj.clone()));
 
-                    if let Value::MemoRef(id) = obj {
-                        self.memoize(id, state.clone())?;
-                        self.stack.push(state);
+                    // Resolve state if it's a MemoRef
+                    let resolved_state = self.resolve(Some(state.clone())).unwrap_or(state.clone());
+
+                    match obj {
+                        Value::MemoRef(id) => {
+                            // Check if the memo'd value is an Object
+                            let is_object =
+                                matches!(self.memo.get(&id), Some((Value::Object(_), _)));
+                            if is_object {
+                                // Convert state before mutably borrowing memo
+                                let public_state = self.de_value_to_public_value(resolved_state);
+                                if let Some((Value::Object(o), _)) = self.memo.get_mut(&id) {
+                                    o.__setstate__(public_state);
+                                }
+                                let updated = self.memo.get(&id).unwrap().0.clone();
+                                self.stack.push(updated);
+                            } else {
+                                self.memoize(id, state.clone())?;
+                                self.stack.push(state);
+                            }
+                        }
+                        Value::Object(mut o) => {
+                            o.__setstate__(self.de_value_to_public_value(resolved_state));
+                            self.stack.push(Value::Object(o));
+                        }
+                        _ => {
+                            // Legacy behavior: replace standin with state
+                            self.stack.push(state);
+                        }
                     }
                 }
             }
@@ -1004,6 +1140,95 @@ impl<R: Read> Deserializer<R> {
         Value::Int(val)
     }
 
+    /// Create an object using the factory callback, or fall back to DictObject.
+    fn make_object(&self, modname: &str, globname: &str) -> Value {
+        let info = crate::object::ObjectConstructionInfo {
+            module: modname,
+            class: globname,
+        };
+        // Try user factory first
+        if let Some(ref factory) = self.options.object_factory
+            && let Some(obj) = factory(info)
+        {
+            return Value::Object(obj);
+        }
+        // Fall back to DictObject
+        Value::Object(Box::new(DictObject::new(
+            modname.to_owned(),
+            globname.to_owned(),
+        )))
+    }
+
+    /// Convert internal de::Value to public value::Value for passing to PickleObject methods.
+    /// Resolves MemoRefs using the deserializer's memo table.
+    fn de_value_to_public_value(&self, v: Value) -> value::Value {
+        // Resolve MemoRef first
+        let v = match v {
+            Value::MemoRef(id) => match self.memo.get(&id) {
+                Some((val, _)) => val.clone(),
+                None => return value::Value::None,
+            },
+            other => other,
+        };
+        match v {
+            Value::None => value::Value::None,
+            Value::Bool(b) => value::Value::Bool(b),
+            Value::I64(i) => value::Value::I64(i),
+            Value::Int(i) => value::Value::Int(i),
+            Value::F64(f) => value::Value::F64(f),
+            Value::Bytes(b) => value::Value::Bytes(b),
+            Value::String(s) => value::Value::String(s),
+            Value::Tuple(t) => {
+                let converted = t
+                    .inner()
+                    .iter()
+                    .cloned()
+                    .map(|v| self.de_value_to_public_value(v))
+                    .collect();
+                value::Value::Tuple(SharedFrozen::new(converted))
+            }
+            Value::List(l) => {
+                let converted = l
+                    .inner()
+                    .iter()
+                    .cloned()
+                    .map(|v| self.de_value_to_public_value(v))
+                    .collect();
+                value::Value::List(Shared::new(converted))
+            }
+            Value::Dict(d) => {
+                let mut map = BTreeMap::new();
+                for (k, v) in d.inner().iter() {
+                    if let Ok(hk) = self.de_value_to_public_value(k.clone()).into_hashable() {
+                        map.insert(hk, self.de_value_to_public_value(v.clone()));
+                    }
+                }
+                value::Value::Dict(Shared::new(map))
+            }
+            Value::Set(s) => {
+                let converted = s
+                    .inner()
+                    .iter()
+                    .cloned()
+                    .filter_map(|v| self.de_value_to_public_value(v).into_hashable().ok())
+                    .collect();
+                value::Value::Set(Shared::new(converted))
+            }
+            Value::FrozenSet(s) => {
+                let converted = s
+                    .inner()
+                    .iter()
+                    .cloned()
+                    .filter_map(|v| self.de_value_to_public_value(v).into_hashable().ok())
+                    .collect();
+                value::Value::FrozenSet(SharedFrozen::new(converted))
+            }
+            Value::Object(o) => value::Value::Object(o),
+            Value::MemoRef(_) => unreachable!("already resolved above"),
+            Value::Global(_) => value::Value::None,
+        }
+    }
+
     // Modify the stack-top list.
     fn modify_list<F>(&mut self, f: F) -> Result<()>
     where
@@ -1037,7 +1262,7 @@ impl<R: Read> Deserializer<R> {
         }
     }
 
-    // Modify the stack-top dict.
+    // Modify the stack-top dict, or call __setitem__ on an Object.
     fn modify_dict<F>(&mut self, f: F) -> Result<()>
     where
         F: FnOnce(&mut Vec<(Value, Value)>),
@@ -1048,6 +1273,28 @@ impl<R: Read> Deserializer<R> {
             Value::Dict(ref dict) => {
                 let mut dict = dict.inner_mut();
                 f(&mut dict);
+                return Ok(());
+            }
+            Value::Object(_) => {
+                // Collect items via the closure, then convert and dispatch to __setitem__
+                let mut items = Vec::new();
+                f(&mut items);
+                let converted: Vec<_> = items
+                    .into_iter()
+                    .map(|(k, v)| {
+                        (
+                            self.de_value_to_public_value(k),
+                            self.de_value_to_public_value(v),
+                        )
+                    })
+                    .collect();
+                // Re-borrow top to get the Object
+                let top = self.top()?;
+                if let Value::Object(ref mut obj) = *top {
+                    for (key, value) in converted {
+                        obj.__setitem__(key, value);
+                    }
+                }
                 return Ok(());
             }
             _ => {
@@ -1174,21 +1421,35 @@ impl<R: Read> Deserializer<R> {
                 }
             }
             Value::Global(Global::Reconstructor) => {
-                let _args = self.resolve(argtuple.pop());
-                let _func = self.resolve(argtuple.pop());
+                let _state = self.resolve(argtuple.pop());
+                let _base_cls = self.resolve(argtuple.pop());
+                let cls = self.resolve(argtuple.pop());
 
-                let value = if self.options.replace_reconstructor_objects_with_dict {
-                    Value::Dict(Shared::new(Default::default()))
+                if self.options.object_factory.is_some()
+                    || self.options.replace_reconstructor_objects_with_dict
+                {
+                    let (modname, globname) = match &cls {
+                        Some(Value::Global(Global::Other { modname, globname })) => {
+                            (modname.as_ref(), globname.as_ref())
+                        }
+                        _ => {
+                            return Self::stack_error(
+                                "global reference",
+                                cls.as_ref().unwrap_or(&Value::None),
+                                self.pos,
+                            );
+                        }
+                    };
+                    let obj = self.make_object(modname, globname);
+                    self.stack.push(obj);
                 } else {
                     // If the user doesn't want to replace reconstructor objects, transition this to an unresolved global
                     // so that we can bubble up unresolved global errors.
-                    Value::Global(Global::Other {
+                    self.stack.push(Value::Global(Global::Other {
                         modname: Cow::Borrowed("copy_reg"),
                         globname: Cow::Borrowed("_reconstructor"),
-                    })
-                };
-
-                self.stack.push(value);
+                    }));
+                }
                 Ok(())
             }
             Value::Global(Global::Other { modname, globname }) => {
@@ -1315,14 +1576,19 @@ impl<R: Read> Deserializer<R> {
 
                 Ok(new_value)
             }
+            Value::Object(o) => Ok(value::Value::Object(o)),
             Value::MemoRef(memo_id) => {
                 self.resolve_recursive(memo_id, (), |slf, (), value| slf.convert_value(value))
             }
             Value::Global(Global::Reconstructor) => {
-                // TODO: This I _think_ is unreachable? Global::Reconstructor instances should have been
-                // reduced to an empty dict by this point
-                if self.options.replace_reconstructor_objects_with_dict {
-                    Ok(value::Value::Dict(Shared::new(Default::default())))
+                if self.options.object_factory.is_some()
+                    || self.options.replace_reconstructor_objects_with_dict
+                {
+                    let obj = self.make_object("copy_reg", "_reconstructor");
+                    Ok(value::Value::Object(match obj {
+                        Value::Object(o) => o,
+                        _ => unreachable!(),
+                    }))
                 } else {
                     Err(Error::Syntax(ErrorCode::UnresolvedGlobal))
                 }
@@ -1413,6 +1679,12 @@ impl<'de: 'a, 'a, R: Read> de::Deserializer<'de> for &'a mut Deserializer<R> {
                     slf.value = Some(value);
                     slf.deserialize_any(visitor)
                 })
+            }
+            Value::Object(o) => {
+                // Convert to public Value, then use value_impls Deserializer
+                let public_val = o.__reduce__().state_or_none();
+                let mut de = crate::value_impls::Deserializer::new(public_val);
+                serde::de::Deserializer::deserialize_any(&mut de, visitor)
             }
             Value::Global(_) => {
                 if self.options.replace_unresolved_globals {

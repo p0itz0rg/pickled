@@ -304,6 +304,10 @@ impl<'de: 'a, 'a> de::Deserializer<'de> for &'a mut Deserializer {
                     len,
                 })
             }
+            Value::Object(o) => {
+                self.value = Some(o.__reduce__().state_or_none());
+                self.deserialize_any(visitor)
+            }
         }
     }
 
