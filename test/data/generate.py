@@ -1,31 +1,47 @@
-# Copyright (c) 2015-2021 Georg Brandl.  Licensed under the Apache License,
-# Version 2.0 <LICENSE-APACHE or http:#www.apache.org/licenses/LICENSE-2.0>
-# or the MIT license <LICENSE-MIT or http:#opensource.org/licenses/MIT>, at
-# your option. This file may not be copied, modified, or distributed except
-# according to those terms.
+# /// script
+# requires-python = ">=3.9"
+# ///
+"""
+Regenerate pickle test fixtures.
 
-"""Generate Pickle test cases for the test suite."""
+Usage:
+    uv run scripts/generate_test_data.py
+"""
 
-# Run this with both Python 2.x and 3.x to generate all test files.
-
+import math
+import os
+import pickle
 import sys
-try:
-    import cPickle as pickle
-except ImportError:
-    import pickle
 
-longish = 10000000000 * 10000000000  # > 64 bits
+OUT = os.path.join(os.path.dirname(__file__), "..", "test", "data")
+MAX_PROTO = 5
 
-class Class(object):
+
+def write(name, obj, proto):
+    path = os.path.join(OUT, f"{name}_proto{proto}.pickle")
+    with open(path, "wb") as fp:
+        pickle.dump(obj, fp, proto)
+
+
+def write_single(name, obj, proto=MAX_PROTO):
+    path = os.path.join(OUT, f"{name}.pickle")
+    with open(path, "wb") as fp:
+        pickle.dump(obj, fp, proto)
+
+
+longish = 10_000_000_000 * 10_000_000_000
+
+
+class Class:
     def __init__(self):
         self.attr = 5
 
-class ReduceClass(object):
+
+class ReduceClass:
     def __reduce__(self):
         return (ReduceClass, ())
 
-# A test object that generates all the types supported, with HashableValue
-# and normal Value variants.
+
 test_object = {
     None: None,
     False: (False, True),
@@ -33,7 +49,7 @@ test_object = {
     longish: longish,
     1.0: 1.0,
     b"bytes": b"bytes",
-    u"string": u"string",
+    "string": "string",
     (1, 2): (1, 2, 3),
     frozenset((42, 0)): frozenset((42, 0)),
     (): [
@@ -42,27 +58,77 @@ test_object = {
         {},
         bytearray(b"\x00\x55\xaa\xff"),
     ],
-    7: Class()
+    7: Class(),
 }
 
-# Generate test file depending on protocol and Python major version.
-major = sys.version_info[0]
-max_proto = {2: 2, 3: 5}[major]
-for proto in range(max_proto + 1):
-    with open('tests_py%d_proto%d.pickle' % (major, proto), 'wb') as fp:
+for proto in range(MAX_PROTO + 1):
+    path = os.path.join(OUT, f"tests_py3_proto{proto}.pickle")
+    with open(path, "wb") as fp:
         pickle.dump(test_object, fp, proto)
 
-# Do all else with Python 3 only.
-if major == 2:
-    sys.exit()
-
-# Generate recursive structure.
 rec_list = []
-rec_list.append(([rec_list], ))
-for proto in range(max_proto + 1):
-    with open('test_recursive_proto%d.pickle' % proto, 'wb') as fp:
-        pickle.dump(rec_list, fp, proto)
+rec_list.append(([rec_list],))
+for proto in range(MAX_PROTO + 1):
+    write("test_recursive", rec_list, proto)
 
-# Generate a GLOBAL reference that leads to an unresolvable global.
-with open('test_unresolvable_global.pickle', 'wb') as fp:
-    pickle.dump(ReduceClass(), fp, max_proto)
+write_single("test_unresolvable_global", ReduceClass())
+
+
+class SimpleClass:
+    def __init__(self):
+        self.x = 42
+        self.name = "hello"
+
+
+class SlottedClass:
+    __slots__ = ["x", "y"]
+    def __init__(self):
+        self.x = 10
+        self.y = 20
+
+
+class NestedClass:
+    def __init__(self):
+        self.inner = SimpleClass()
+        self.value = [1, 2, 3]
+
+
+class EmptyClass:
+    pass
+
+
+for proto in range(MAX_PROTO + 1):
+    write("test_simple_class", SimpleClass(), proto)
+    write("test_nested_class", NestedClass(), proto)
+    write("test_empty_class", EmptyClass(), proto)
+
+for proto in range(2, MAX_PROTO + 1):
+    write("test_slotted_class", SlottedClass(), proto)
+
+write_single("test_numeric_edges", {
+    "float_bigint_equal": (2**53, float(2**53)),
+    "float_bigint_off_by_one": (2**53 + 1, float(2**53)),
+    "huge_int_vs_float": (2**100, 1.0e30),
+    "neg_huge": (-(2**100), -1.0e30),
+    "neg_zero": (-0.0, 0.0),
+    "int_one_float_one": (1, 1.0),
+    "bool_int_float": (True, 1, 1.0),
+})
+
+nan = float("nan")
+write_single("test_nan_and_zeros", {
+    "nan_in_list": [nan, 1, 2],
+    "nan_in_set": {nan},
+    "neg_zero_in_set": {-0.0, 0.0},
+    "int_float_in_set": {1, 1.0},
+})
+
+write_single("test_set_dedup", {1, 1.0, True})
+
+d = {}
+d[1] = "int"
+d[1.0] = "float"
+d[True] = "bool"
+write_single("test_dict_numeric_keys", d)
+
+print(f"wrote to {os.path.abspath(OUT)}")
