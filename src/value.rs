@@ -14,14 +14,21 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 pub use crate::value_impls::{from_value, to_value};
 
 use crate::error::{Error, ErrorCode};
 use crate::object::PickleObject;
 
-#[derive(Debug, Eq, PartialOrd, Ord, Clone)]
-pub struct Shared<T>(Rc<RefCell<T>>);
+static NEXT_SHARED_ID: AtomicU64 = AtomicU64::new(0);
+
+fn next_id() -> u64 {
+    NEXT_SHARED_ID.fetch_add(1, AtomicOrdering::Relaxed)
+}
+
+#[derive(Clone)]
+pub struct Shared<T>(Rc<RefCell<T>>, u64);
 
 impl<T> Shared<T> {
     pub fn new(value: T) -> Self {
@@ -36,8 +43,16 @@ impl<T> Shared<T> {
         self.0.borrow_mut()
     }
 
-    pub fn provenance(&self) -> usize {
-        Rc::as_ptr(&self.0).expose_provenance()
+    pub fn id(&self) -> u64 {
+        self.1
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for Shared<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Shared(")?;
+        self.0.fmt(f)?;
+        write!(f, ")")
     }
 }
 
@@ -89,20 +104,48 @@ where
     }
 }
 
-#[derive(Debug, Eq, PartialOrd, Ord, Clone)]
-pub struct SharedFrozen<T>(Rc<T>);
+impl<T> Eq for Shared<T> where T: Eq {}
+
+impl<T> PartialOrd for Shared<T>
+where
+    T: PartialOrd,
+{
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.0.borrow().partial_cmp(&*other.0.borrow())
+    }
+}
+
+impl<T> Ord for Shared<T>
+where
+    T: Ord,
+{
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.borrow().cmp(&*other.0.borrow())
+    }
+}
+
+#[derive(Clone)]
+pub struct SharedFrozen<T>(Rc<T>, u64);
 
 impl<T> SharedFrozen<T> {
     pub fn new(value: T) -> Self {
-        SharedFrozen(Rc::new(value))
+        SharedFrozen(Rc::new(value), next_id())
     }
 
     pub fn inner(&self) -> &T {
         self.0.as_ref()
     }
 
-    pub fn provenance(&self) -> usize {
-        Rc::as_ptr(&self.0).expose_provenance()
+    pub fn id(&self) -> u64 {
+        self.1
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for SharedFrozen<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SharedFrozen(")?;
+        self.0.fmt(f)?;
+        write!(f, ")")
     }
 }
 
@@ -151,6 +194,26 @@ where
         let other_inner = other.inner();
 
         this_inner.eq(other_inner)
+    }
+}
+
+impl<T> Eq for SharedFrozen<T> where T: Eq {}
+
+impl<T> PartialOrd for SharedFrozen<T>
+where
+    T: PartialOrd,
+{
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.inner().partial_cmp(other.inner())
+    }
+}
+
+impl<T> Ord for SharedFrozen<T>
+where
+    T: Ord,
+{
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.inner().cmp(other.inner())
     }
 }
 

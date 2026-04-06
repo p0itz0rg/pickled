@@ -218,7 +218,7 @@ pub struct Deserializer<R: Read> {
     memo: BTreeMap<MemoId, (Value, i32)>,       // pickle memo (value, number of refs)
     stack: Vec<Value>,                          // topmost items on the stack
     stacks: Vec<Vec<Value>>,                    // items further down the stack, between MARKs
-    converted_rc: HashMap<usize, value::Value>, // shared items that have already been converted
+    converted_rc: HashMap<u64, value::Value>, // shared items that have already been converted
     strings_rc: HashMap<Vec<u8>, Value>,
     tuple_rc: BTreeMap<Vec<value::RawHashableValue>, Value>,
 }
@@ -1493,9 +1493,9 @@ impl<R: Read> Deserializer<R> {
             Value::Bytes(v) => Ok(value::Value::Bytes(v)),
             Value::String(v) => Ok(value::Value::String(v)),
             Value::List(v) => {
-                let inner_ptr = v.provenance();
+                let id = v.id();
 
-                if let Some(converted) = self.converted_rc.get(&inner_ptr) {
+                if let Some(converted) = self.converted_rc.get(&id) {
                     return Ok(converted.clone());
                 }
 
@@ -1508,14 +1508,14 @@ impl<R: Read> Deserializer<R> {
                 let new_shared = Shared::new(new?);
 
                 let new_value = value::Value::List(new_shared.clone());
-                self.converted_rc.insert(inner_ptr, new_value.clone());
+                self.converted_rc.insert(id, new_value.clone());
 
                 Ok(new_value)
             }
             Value::Tuple(v) => {
-                let inner_ptr = v.provenance();
+                let id = v.id();
 
-                if let Some(converted) = self.converted_rc.get(&inner_ptr) {
+                if let Some(converted) = self.converted_rc.get(&id) {
                     return Ok(converted.clone());
                 }
 
@@ -1528,7 +1528,7 @@ impl<R: Read> Deserializer<R> {
                 let new_shared = SharedFrozen::new(new);
 
                 let new_value = value::Value::Tuple(new_shared.clone());
-                self.converted_rc.insert(inner_ptr, new_value.clone());
+                self.converted_rc.insert(id, new_value.clone());
 
                 Ok(new_value)
             }
@@ -1552,9 +1552,9 @@ impl<R: Read> Deserializer<R> {
                 Ok(value::Value::FrozenSet(SharedFrozen::new(new?)))
             }
             Value::Dict(v) => {
-                let inner_ptr = v.provenance();
+                let id = v.id();
 
-                if let Some(converted) = self.converted_rc.get(&inner_ptr) {
+                if let Some(converted) = self.converted_rc.get(&id) {
                     return Ok(converted.clone());
                 }
 
@@ -1572,7 +1572,7 @@ impl<R: Read> Deserializer<R> {
                 let new_shared = Shared::new(map);
 
                 let new_value = value::Value::Dict(new_shared.clone());
-                self.converted_rc.insert(inner_ptr, new_value.clone());
+                self.converted_rc.insert(id, new_value.clone());
 
                 Ok(new_value)
             }
