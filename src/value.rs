@@ -6,8 +6,8 @@
 
 //! Python values, and serialization instances for them.
 
-use num_bigint::BigInt;
-use num_traits::{Signed, ToPrimitive};
+use num_bigint::{BigInt, Sign};
+use num_traits::{Float, Signed, ToPrimitive};
 use std::borrow::Cow;
 use std::cell::{Ref, RefCell, RefMut};
 use std::cmp::Ordering;
@@ -32,7 +32,7 @@ pub struct Shared<T>(Rc<RefCell<T>>, u64);
 
 impl<T> Shared<T> {
     pub fn new(value: T) -> Self {
-        Shared(Rc::new(RefCell::new(value)))
+        Shared(Rc::new(RefCell::new(value)), next_id())
     }
 
     pub fn inner<'a>(&'a self) -> Ref<'a, T> {
@@ -283,6 +283,8 @@ impl PartialEq for Value {
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::I64(a), Value::I64(b)) => a == b,
             (Value::Int(a), Value::Int(b)) => a == b,
+            (Value::I64(a), Value::Int(b)) => BigInt::from(*a) == *b,
+            (Value::Int(a), Value::I64(b)) => *a == BigInt::from(*b),
             (Value::F64(a), Value::F64(b)) => a == b,
             (Value::Bytes(a), Value::Bytes(b)) => a == b,
             (Value::String(a), Value::String(b)) => a == b,
@@ -380,6 +382,19 @@ impl Value {
         }
     }
 
+    /// Returns true if this value or any nested value contains a NaN float.
+    pub fn contains_nan(&self) -> bool {
+        match self {
+            Value::F64(f) => f.is_nan(),
+            Value::List(v) => v.inner().iter().any(|v| v.contains_nan()),
+            Value::Tuple(v) => v.inner().iter().any(|v| v.contains_nan()),
+            Value::Set(v) => v.inner().iter().any(|v| v.contains_nan()),
+            Value::FrozenSet(v) => v.inner().iter().any(|v| v.contains_nan()),
+            Value::Dict(v) => v.inner().iter().any(|(k, v)| k.contains_nan() || v.contains_nan()),
+            _ => false,
+        }
+    }
+
     pub(crate) fn into_raw_hashable(self) -> Result<RawHashableValue, Error> {
         match self {
             Value::None => Ok(RawHashableValue::None),
@@ -407,6 +422,16 @@ impl Value {
 }
 
 impl HashableValue {
+    /// Returns true if this value or any nested value contains a NaN float.
+    pub fn contains_nan(&self) -> bool {
+        match self {
+            HashableValue::F64(f) => f.is_nan(),
+            HashableValue::Tuple(v) => v.inner().iter().any(|v| v.contains_nan()),
+            HashableValue::FrozenSet(v) => v.inner().iter().any(|v| v.contains_nan()),
+            _ => false,
+        }
+    }
+
     /// Convert the value into its non-hashable version.  This always works.
     pub fn into_value(self) -> Value {
         match self {
@@ -548,7 +573,32 @@ impl fmt::Display for HashableValue {
 
 impl PartialEq for HashableValue {
     fn eq(&self, other: &HashableValue) -> bool {
-        self.cmp(other) == Ordering::Equal
+        use self::HashableValue::*;
+        match (self, other) {
+            (None, None) => true,
+            (Bool(a), Bool(b)) => a == b,
+            // Cross-type numeric equality, matching Python semantics
+            (Bool(a), I64(b)) => (*a as i64) == *b,
+            (I64(a), Bool(b)) => *a == (*b as i64),
+            (I64(a), I64(b)) => a == b,
+            (I64(a), Int(b)) => BigInt::from(*a) == *b,
+            (Int(a), I64(b)) => *a == BigInt::from(*b),
+            (Int(a), Int(b)) => a == b,
+            // Float comparisons use IEEE 754 semantics (NaN != NaN, -0.0 == 0.0)
+            (F64(a), F64(b)) => a == b,
+            (Bool(a), F64(b)) => (*a as i64 as f64) == *b,
+            (F64(a), Bool(b)) => *a == (*b as i64 as f64),
+            // Use exact comparison via float_bigint_ord to avoid f64 precision loss
+            (I64(a), F64(b)) => float_bigint_ord(&BigInt::from(*a), *b) == Ordering::Equal,
+            (F64(a), I64(b)) => float_bigint_ord(&BigInt::from(*b), *a) == Ordering::Equal,
+            (Int(a), F64(b)) => float_bigint_ord(a, *b) == Ordering::Equal,
+            (F64(a), Int(b)) => float_bigint_ord(b, *a) == Ordering::Equal,
+            (Bytes(a), Bytes(b)) => a == b,
+            (String(a), String(b)) => a == b,
+            (FrozenSet(a), FrozenSet(b)) => a == b,
+            (Tuple(a), Tuple(b)) => a == b,
+            _ => false,
+        }
     }
 }
 
@@ -590,7 +640,7 @@ impl Ord for HashableValue {
                 Bool(b) => i.cmp(&(b as i64)),
                 I64(i2) => i.cmp(&i2),
                 Int(ref bi) => BigInt::from(i).cmp(bi),
-                F64(f) => float_ord(i as f64, f),
+                F64(f) => float_bigint_ord(&BigInt::from(i), f),
                 _ => Ordering::Less,
             },
             Int(ref bi) => match *other {
@@ -604,8 +654,8 @@ impl Ord for HashableValue {
             F64(f) => match *other {
                 None => Ordering::Greater,
                 Bool(b) => float_ord(f, b as i64 as f64),
-                I64(i) => float_ord(f, i as f64),
-                Int(ref bi) => BigInt::from(f as i64).cmp(bi),
+                I64(i) => float_bigint_ord(&BigInt::from(i), f).reverse(),
+                Int(ref bi) => float_bigint_ord(bi, f).reverse(),
                 F64(f2) => float_ord(f, f2),
                 _ => Ordering::Less,
             },
@@ -632,30 +682,116 @@ impl Ord for HashableValue {
     }
 }
 
-/// A "reasonable" total ordering for floats.
+/// Total ordering for floats. Uses IEEE comparison (-0.0 == 0.0) with
+/// NaN sorted after all other values for BTreeSet consistency.
 fn float_ord(f: f64, g: f64) -> Ordering {
     match f.partial_cmp(&g) {
-        Some(o) => o,
-        None => Ordering::Less,
+        Some(ord) => ord,
+        None => match (f.is_nan(), g.is_nan()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            (false, false) => unreachable!(),
+        },
     }
 }
 
-/// A "reasonable" total ordering for floats.
+/// Alias used by the derived Ord for RawHashableValue.
 fn total_float_ord(f: f64, g: f64) -> Ordering {
-    f.total_cmp(&g)
+    float_ord(f, g)
 }
 
-/// Ordering between floats and big integers.
-fn float_bigint_ord(bi: &BigInt, g: f64) -> Ordering {
-    match bi.to_f64() {
-        Some(f) => float_ord(f, g),
-        None => {
-            if bi.is_positive() {
-                Ordering::Greater
-            } else {
-                Ordering::Less
-            }
+/// Exact ordering between a BigInt and an f64, matching CPython's
+/// float_richcompare algorithm.
+fn float_bigint_ord(bi: &BigInt, f: f64) -> Ordering {
+    // If f is NaN or infinity, the int's magnitude is irrelevant.
+    if !f.is_finite() {
+        return if f.is_nan() {
+            Ordering::Less // NaN sorts after everything
+        } else if f > 0.0 {
+            Ordering::Less // int < +inf
+        } else {
+            Ordering::Greater // int > -inf
+        };
+    }
+
+    let fsign: i32 = if f == 0.0 { 0 } else if f < 0.0 { -1 } else { 1 };
+    let isign: i32 = match bi.sign() {
+        Sign::Minus => -1,
+        Sign::Plus => 1,
+        Sign::NoSign => 0,
+    };
+
+    // Different signs determine the outcome immediately.
+    if isign != fsign {
+        return isign.cmp(&fsign);
+    }
+
+    // Both zero.
+    if isign == 0 {
+        return Ordering::Equal;
+    }
+
+    // Same sign. Compare bit counts.
+    let nbits = bi.bits();
+
+    if nbits <= 48 {
+        // Safe to convert to f64 without precision loss.
+        if let Some(bi_f) = bi.to_f64() {
+            return bi_f.partial_cmp(&f).unwrap_or(Ordering::Equal);
         }
+    }
+
+    // Use integer_decode to get the exact mantissa and exponent.
+    // f = sign * mantissa * 2^exponent, where mantissa is a u64.
+    let (mantissa, exponent, _sign) = Float::integer_decode(f.abs());
+
+    // Number of significant bits in the mantissa.
+    let mantissa_bits = 64 - mantissa.leading_zeros() as i64;
+    // Number of bits before the radix point in the float.
+    let float_nbits = mantissa_bits + exponent as i64;
+
+    if float_nbits < nbits as i64 {
+        // Float has fewer bits; int is larger in magnitude.
+        return if isign > 0 {
+            Ordering::Greater
+        } else {
+            Ordering::Less
+        };
+    }
+    if float_nbits > nbits as i64 {
+        // Float has more bits; float is larger in magnitude.
+        return if isign > 0 {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        };
+    }
+
+    // Same number of bits. Construct exact BigInt representation of the float
+    // and compare. f = mantissa * 2^exponent (for the absolute value).
+    let float_as_bigint = if exponent >= 0 {
+        BigInt::from(mantissa) << exponent as u64
+    } else {
+        // Float has a fractional part. Shift the int up instead so we
+        // compare mantissa vs (int << -exponent), avoiding fractions.
+        let shift = (-exponent) as u64;
+        let ww = bi.abs() << shift;
+        // We want bi.cmp(f), i.e. (int << shift).cmp(mantissa)
+        let magnitude_ord = ww.cmp(&BigInt::from(mantissa));
+        return if isign < 0 {
+            magnitude_ord.reverse()
+        } else {
+            magnitude_ord
+        };
+    };
+
+    // We want bi.cmp(f), i.e. bi.abs().cmp(float_as_bigint)
+    let magnitude_ord = bi.abs().cmp(&float_as_bigint);
+    if isign < 0 {
+        magnitude_ord.reverse()
+    } else {
+        magnitude_ord
     }
 }
 
