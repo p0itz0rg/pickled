@@ -132,6 +132,21 @@ d[True] = "bool"
 write_single("test_dict_numeric_keys", d)
 
 
+shared_list = [1, 2, 3]
+shared_dict = {"key": "value"}
+shared_string = "hello" * 100
+shared_refs_obj = {
+    "a": shared_list,
+    "b": shared_list,
+    "c": shared_dict,
+    "d": shared_dict,
+    "e": shared_string,
+    "f": shared_string,
+}
+for proto in range(MAX_PROTO + 1):
+    write("test_shared_refs", shared_refs_obj, proto)
+
+
 class SmallIntClass:
     def __init__(self):
         self.small = 42
@@ -140,5 +155,18 @@ class SmallIntClass:
 
 for proto in range(MAX_PROTO + 1):
     write("test_bigint_normalization", SmallIntClass(), proto)
+
+
+class ObjWithSharedState:
+    def __init__(self, shared_l, shared_d):
+        self.data = shared_l
+        self.meta = shared_d
+
+_shared_l = [1, 2, 3]
+_shared_d = {"key": "value"}
+_a = ObjWithSharedState(_shared_l, _shared_d)
+_b = ObjWithSharedState(_shared_l, _shared_d)
+for proto in range(2, MAX_PROTO + 1):
+    write("test_shared_object_state", {"a": _a, "b": _b, "raw_list": _shared_l, "raw_dict": _shared_d}, proto)
 
 print(f"wrote to {os.path.abspath(OUT)}")

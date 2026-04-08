@@ -52,7 +52,12 @@ impl<T> Shared<T> {
         self.0.borrow_mut()
     }
 
-    pub fn id(&self) -> u64 {
+    /// Returns true if two `Shared` values point to the same allocation.
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+
+    pub(crate) fn stable_id(&self) -> u64 {
         self.1
     }
 }
@@ -145,7 +150,12 @@ impl<T> SharedFrozen<T> {
         self.0.as_ref()
     }
 
-    pub fn id(&self) -> u64 {
+    /// Returns true if two `SharedFrozen` values point to the same allocation.
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+
+    pub(crate) fn stable_id(&self) -> u64 {
         self.1
     }
 }

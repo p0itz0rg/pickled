@@ -931,4 +931,91 @@ mod value_tests {
             );
         }
     }
+
+    #[test]
+    fn shared_refs_are_deduplicated() {
+        // Python shares memo'd objects by reference. When the same list, dict,
+        // or string appears multiple times in a pickle, deserialization should
+        // produce Shared/SharedFrozen values backed by the same Rc.
+        for proto in 0..=5 {
+            let data =
+                std::fs::read(format!("test/data/test_shared_refs_proto{proto}.pickle")).unwrap();
+            let val = value_from_slice(&data, Default::default()).unwrap();
+            let dict = val.dict_ref().expect("expected dict");
+            let dict = dict.inner();
+
+            let a = dict.get(&hpyobj!(s = "a")).unwrap().list_ref().unwrap();
+            let b = dict.get(&hpyobj!(s = "b")).unwrap().list_ref().unwrap();
+            assert!(a.ptr_eq(b), "proto {proto}: lists should share identity");
+
+            let c = dict.get(&hpyobj!(s = "c")).unwrap().dict_ref().unwrap();
+            let d = dict.get(&hpyobj!(s = "d")).unwrap().dict_ref().unwrap();
+            assert!(c.ptr_eq(d), "proto {proto}: dicts should share identity");
+
+            let e = dict.get(&hpyobj!(s = "e")).unwrap().string_ref().unwrap();
+            let f = dict.get(&hpyobj!(s = "f")).unwrap().string_ref().unwrap();
+            assert!(e.ptr_eq(f), "proto {proto}: strings should share identity");
+        }
+    }
+
+    #[test]
+    fn shared_refs_in_object_state() {
+        // Objects whose __dict__ references the same list/dict should share
+        // them after deserialization (de_value_to_public_value path).
+        for proto in 2..=5 {
+            let data = std::fs::read(format!(
+                "test/data/test_shared_object_state_proto{proto}.pickle"
+            ))
+            .unwrap();
+            let val = value_from_slice(&data, Default::default()).unwrap();
+            let outer = val.dict_ref().expect("expected dict");
+            let outer = outer.inner();
+
+            let obj_a = outer.get(&hpyobj!(s = "a")).unwrap().object_ref().unwrap();
+            let obj_b = outer.get(&hpyobj!(s = "b")).unwrap().object_ref().unwrap();
+            let a_state = obj_a.as_any().downcast_ref::<DictObject>().unwrap().state();
+            let b_state = obj_b.as_any().downcast_ref::<DictObject>().unwrap().state();
+
+            let a_data = a_state
+                .get(&hpyobj!(s = "data"))
+                .unwrap()
+                .list_ref()
+                .unwrap();
+            let b_data = b_state
+                .get(&hpyobj!(s = "data"))
+                .unwrap()
+                .list_ref()
+                .unwrap();
+            assert!(
+                a_data.ptr_eq(b_data),
+                "proto {proto}: object state lists should share identity"
+            );
+
+            let a_meta = a_state
+                .get(&hpyobj!(s = "meta"))
+                .unwrap()
+                .dict_ref()
+                .unwrap();
+            let b_meta = b_state
+                .get(&hpyobj!(s = "meta"))
+                .unwrap()
+                .dict_ref()
+                .unwrap();
+            assert!(
+                a_meta.ptr_eq(b_meta),
+                "proto {proto}: object state dicts should share identity"
+            );
+
+            // The raw_list at the top level should share identity with the objects' lists
+            let raw_list = outer
+                .get(&hpyobj!(s = "raw_list"))
+                .unwrap()
+                .list_ref()
+                .unwrap();
+            assert!(
+                raw_list.ptr_eq(a_data),
+                "proto {proto}: raw list and object state list should share identity"
+            );
+        }
+    }
 }

@@ -1175,7 +1175,7 @@ impl<R: Read> Deserializer<R> {
 
     /// Convert internal de::Value to public value::Value for passing to PickleObject methods.
     /// Resolves MemoRefs using the deserializer's memo table.
-    fn de_value_to_public_value(&self, v: Value) -> value::Value {
+    fn de_value_to_public_value(&mut self, v: Value) -> value::Value {
         // Resolve MemoRef first
         let v = match v {
             Value::MemoRef(id) => match self.memo.get(&id) {
@@ -1199,49 +1199,79 @@ impl<R: Read> Deserializer<R> {
             Value::Bytes(b) => value::Value::Bytes(b),
             Value::String(s) => value::Value::String(s),
             Value::Tuple(t) => {
+                let id = t.stable_id();
+                if let Some(v) = self.converted_rc.get(&id) {
+                    return v.clone();
+                }
                 let converted = t
                     .inner()
                     .iter()
                     .cloned()
                     .map(|v| self.de_value_to_public_value(v))
                     .collect();
-                value::Value::Tuple(SharedFrozen::new(converted))
+                let val = value::Value::Tuple(SharedFrozen::new(converted));
+                self.converted_rc.insert(id, val.clone());
+                val
             }
             Value::List(l) => {
+                let id = l.stable_id();
+                if let Some(v) = self.converted_rc.get(&id) {
+                    return v.clone();
+                }
                 let converted = l
                     .inner()
                     .iter()
                     .cloned()
                     .map(|v| self.de_value_to_public_value(v))
                     .collect();
-                value::Value::List(Shared::new(converted))
+                let val = value::Value::List(Shared::new(converted));
+                self.converted_rc.insert(id, val.clone());
+                val
             }
             Value::Dict(d) => {
+                let id = d.stable_id();
+                if let Some(v) = self.converted_rc.get(&id) {
+                    return v.clone();
+                }
                 let mut map = BTreeMap::new();
                 for (k, v) in d.inner().iter() {
                     if let Ok(hk) = self.de_value_to_public_value(k.clone()).into_hashable() {
                         map.insert(hk, self.de_value_to_public_value(v.clone()));
                     }
                 }
-                value::Value::Dict(Shared::new(map))
+                let val = value::Value::Dict(Shared::new(map));
+                self.converted_rc.insert(id, val.clone());
+                val
             }
             Value::Set(s) => {
+                let id = s.stable_id();
+                if let Some(v) = self.converted_rc.get(&id) {
+                    return v.clone();
+                }
                 let converted = s
                     .inner()
                     .iter()
                     .cloned()
                     .filter_map(|v| self.de_value_to_public_value(v).into_hashable().ok())
                     .collect();
-                value::Value::Set(Shared::new(converted))
+                let val = value::Value::Set(Shared::new(converted));
+                self.converted_rc.insert(id, val.clone());
+                val
             }
             Value::FrozenSet(s) => {
+                let id = s.stable_id();
+                if let Some(v) = self.converted_rc.get(&id) {
+                    return v.clone();
+                }
                 let converted = s
                     .inner()
                     .iter()
                     .cloned()
                     .filter_map(|v| self.de_value_to_public_value(v).into_hashable().ok())
                     .collect();
-                value::Value::FrozenSet(SharedFrozen::new(converted))
+                let val = value::Value::FrozenSet(SharedFrozen::new(converted));
+                self.converted_rc.insert(id, val.clone());
+                val
             }
             Value::Object(o) => value::Value::Object(o),
             Value::MemoRef(_) => unreachable!("already resolved above"),
@@ -1513,7 +1543,7 @@ impl<R: Read> Deserializer<R> {
             Value::Bytes(v) => Ok(value::Value::Bytes(v)),
             Value::String(v) => Ok(value::Value::String(v)),
             Value::List(v) => {
-                let id = v.id();
+                let id = v.stable_id();
 
                 if let Some(converted) = self.converted_rc.get(&id) {
                     return Ok(converted.clone());
@@ -1533,7 +1563,7 @@ impl<R: Read> Deserializer<R> {
                 Ok(new_value)
             }
             Value::Tuple(v) => {
-                let id = v.id();
+                let id = v.stable_id();
 
                 if let Some(converted) = self.converted_rc.get(&id) {
                     return Ok(converted.clone());
@@ -1572,7 +1602,7 @@ impl<R: Read> Deserializer<R> {
                 Ok(value::Value::FrozenSet(SharedFrozen::new(new?)))
             }
             Value::Dict(v) => {
-                let id = v.id();
+                let id = v.stable_id();
 
                 if let Some(converted) = self.converted_rc.get(&id) {
                     return Ok(converted.clone());
