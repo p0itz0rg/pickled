@@ -158,7 +158,7 @@ impl<W: io::Write> Serializer<W> {
             }
             Value::Set(ref s) => self.serialize_set(&s.inner(), b"set"),
             Value::FrozenSet(ref s) => self.serialize_set(s.inner(), b"frozenset"),
-            Value::Object(ref o) => self.serialize_object(o.as_ref()),
+            Value::Object(ref o) => self.serialize_object(o.inner().as_ref()),
         }
     }
 
@@ -922,7 +922,7 @@ impl Serialize for Value {
                 }
                 map.end()
             }
-            Value::Object(ref o) => o.__reduce__().state_or_none().serialize(serializer),
+            Value::Object(ref o) => o.inner().__reduce__().state_or_none().serialize(serializer),
         }
     }
 }

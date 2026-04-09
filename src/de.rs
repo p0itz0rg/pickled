@@ -1273,7 +1273,7 @@ impl<R: Read> Deserializer<R> {
                 self.converted_rc.insert(id, val.clone());
                 val
             }
-            Value::Object(o) => value::Value::Object(o),
+            Value::Object(o) => value::Value::Object(Shared::new(o)),
             Value::MemoRef(_) => unreachable!("already resolved above"),
             Value::Global(_) => value::Value::None,
         }
@@ -1626,7 +1626,7 @@ impl<R: Read> Deserializer<R> {
 
                 Ok(new_value)
             }
-            Value::Object(o) => Ok(value::Value::Object(o)),
+            Value::Object(o) => Ok(value::Value::Object(Shared::new(o))),
             Value::MemoRef(memo_id) => {
                 self.resolve_recursive(memo_id, (), |slf, (), value| slf.convert_value(value))
             }
@@ -1635,10 +1635,10 @@ impl<R: Read> Deserializer<R> {
                     || self.options.replace_reconstructor_objects_with_dict
                 {
                     let obj = self.make_object("copy_reg", "_reconstructor");
-                    Ok(value::Value::Object(match obj {
+                    Ok(value::Value::Object(Shared::new(match obj {
                         Value::Object(o) => o,
                         _ => unreachable!(),
-                    }))
+                    })))
                 } else {
                     Err(Error::Syntax(ErrorCode::UnresolvedGlobal))
                 }

@@ -379,7 +379,7 @@ mod value_tests {
                     } else {
                         class_obj.__setstate__(pyobj!(d={s="attr" => i=5}));
                     }
-                    map.insert(hpyobj!(i = 7), Value::Object(Box::new(class_obj)));
+                    map.insert(hpyobj!(i = 7), Value::Object(crate::value::Shared::new(Box::new(class_obj))));
                 } else {
                     // _reconstructor path: BUILD replaces standin with state dict
                     if pyver == 2 {
@@ -550,6 +550,7 @@ mod value_tests {
             let obj = val
                 .object_ref()
                 .unwrap_or_else(|| panic!("proto {proto}: expected Object, got {val:?}"));
+            let obj = obj.inner();
             let (module, class) = obj.class_info();
             assert_eq!(module, "__main__");
             assert_eq!(class, "SimpleClass");
@@ -580,6 +581,7 @@ mod value_tests {
             let obj = val.object_ref().unwrap_or_else(|| {
                 panic!("proto {proto} with replace_reconstructor: expected Object, got {val:?}")
             });
+            let obj = obj.inner();
             let dict_obj = obj
                 .as_any()
                 .downcast_ref::<DictObject>()
@@ -600,6 +602,7 @@ mod value_tests {
                 std::fs::read(format!("test/data/test_slotted_class_proto{proto}.pickle")).unwrap();
             let val = value_from_slice(&data, Default::default()).unwrap();
             let obj = val.object_ref().expect("expected Object");
+            let obj = obj.inner();
             let dict_obj = obj
                 .as_any()
                 .downcast_ref::<DictObject>()
@@ -625,6 +628,7 @@ mod value_tests {
                 std::fs::read(format!("test/data/test_nested_class_proto{proto}.pickle")).unwrap();
             let val = value_from_slice(&data, Default::default()).unwrap();
             let outer = val.object_ref().expect("expected Object");
+            let outer = outer.inner();
             let outer_dict = outer
                 .as_any()
                 .downcast_ref::<DictObject>()
@@ -639,6 +643,7 @@ mod value_tests {
             let inner_key = hpyobj!(s = "inner");
             let inner_val = outer_dict.state().get(&inner_key).unwrap();
             let inner_obj = inner_val.object_ref().expect("inner should be Object");
+            let inner_obj = inner_obj.inner();
             let inner_dict = inner_obj
                 .as_any()
                 .downcast_ref::<DictObject>()
@@ -658,6 +663,7 @@ mod value_tests {
                 std::fs::read(format!("test/data/test_empty_class_proto{proto}.pickle")).unwrap();
             let val = value_from_slice(&data, Default::default()).unwrap();
             let obj = val.object_ref().expect("expected Object");
+            let obj = obj.inner();
             let dict_obj = obj
                 .as_any()
                 .downcast_ref::<DictObject>()
@@ -737,6 +743,7 @@ mod value_tests {
         let data = std::fs::read("test/data/test_simple_class_proto4.pickle").unwrap();
         let val = value_from_slice(&data, DeOptions::new().object_factory(factory)).unwrap();
         let obj = val.object_ref().expect("expected Object");
+        let obj = obj.inner();
         assert!(
             obj.as_any().downcast_ref::<CustomObj>().is_some(),
             "SimpleClass should be handled by custom factory"
@@ -762,6 +769,7 @@ mod value_tests {
         let data = std::fs::read("test/data/test_nested_class_proto4.pickle").unwrap();
         let val = value_from_slice(&data, DeOptions::new().object_factory(factory2)).unwrap();
         let obj = val.object_ref().expect("expected Object");
+        let obj = obj.inner();
         let custom = obj.as_any().downcast_ref::<CustomObj>().unwrap();
         if let Some(state) = &custom.state_value {
             if let Value::Dict(d) = state {
@@ -908,6 +916,7 @@ mod value_tests {
             .unwrap();
             let val = value_from_slice(&data, Default::default()).unwrap();
             let obj = val.object_ref().expect("expected Object");
+            let obj = obj.inner();
             let dict_obj = obj
                 .as_any()
                 .downcast_ref::<DictObject>()
@@ -972,7 +981,9 @@ mod value_tests {
             let outer = outer.inner();
 
             let obj_a = outer.get(&hpyobj!(s = "a")).unwrap().object_ref().unwrap();
+            let obj_a = obj_a.inner();
             let obj_b = outer.get(&hpyobj!(s = "b")).unwrap().object_ref().unwrap();
+            let obj_b = obj_b.inner();
             let a_state = obj_a.as_any().downcast_ref::<DictObject>().unwrap().state();
             let b_state = obj_b.as_any().downcast_ref::<DictObject>().unwrap().state();
 

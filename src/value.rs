@@ -36,8 +36,13 @@ fn next_id() -> u64 {
     NEXT_SHARED_ID.fetch_add(1, AtomicOrdering::Relaxed)
 }
 
-#[derive(Clone)]
 pub struct Shared<T>(Rc<RefCell<T>>, u64);
+
+impl<T> Clone for Shared<T> {
+    fn clone(&self) -> Self {
+        Shared(Rc::clone(&self.0), self.1)
+    }
+}
 
 impl<T> Shared<T> {
     pub fn new(value: T) -> Self {
@@ -59,6 +64,11 @@ impl<T> Shared<T> {
 
     pub(crate) fn stable_id(&self) -> u64 {
         self.1
+    }
+
+    /// Returns the raw pointer to the inner `RefCell<T>` for identity comparison.
+    pub fn rc_ptr(&self) -> *const T {
+        self.0.as_ptr()
     }
 }
 
@@ -157,6 +167,11 @@ impl<T> SharedFrozen<T> {
 
     pub(crate) fn stable_id(&self) -> u64 {
         self.1
+    }
+
+    /// Returns a reference to the inner `Rc<T>`.
+    pub fn rc_ref(&self) -> &Rc<T> {
+        &self.0
     }
 }
 
@@ -272,7 +287,7 @@ pub enum Value {
     /// Dictionary (map)
     Dict(Shared<BTreeMap<HashableValue, Value>>),
     /// Python object reconstructed during unpickling
-    Object(Box<dyn PickleObject>),
+    Object(Shared<Box<dyn PickleObject>>),
 }
 
 impl Clone for Value {
@@ -290,7 +305,7 @@ impl Clone for Value {
             Value::Set(s) => Value::Set(s.clone()),
             Value::FrozenSet(s) => Value::FrozenSet(s.clone()),
             Value::Dict(d) => Value::Dict(d.clone()),
-            Value::Object(o) => Value::Object(o.clone_dyn()),
+            Value::Object(o) => Value::Object(o.clone()),
         }
     }
 }
@@ -312,7 +327,9 @@ impl PartialEq for Value {
             (Value::Set(a), Value::Set(b)) => a == b,
             (Value::FrozenSet(a), Value::FrozenSet(b)) => a == b,
             (Value::Dict(a), Value::Dict(b)) => a == b,
-            (Value::Object(a), Value::Object(b)) => a.eq_dyn(b.as_ref()),
+            (Value::Object(a), Value::Object(b)) => {
+                a.ptr_eq(b) || a.inner().eq_dyn(b.inner().as_ref())
+            }
             _ => false,
         }
     }
@@ -396,7 +413,7 @@ impl Value {
             Value::String(s) => Ok(HashableValue::String(s)),
             Value::FrozenSet(v) => Ok(HashableValue::FrozenSet(v)),
             Value::Tuple(v) => values_to_hashable(v).map(HashableValue::Tuple),
-            Value::Object(o) => o.__hash__(),
+            Value::Object(o) => o.inner().__hash__(),
             _ => Err(Error::Syntax(ErrorCode::ValueNotHashable)),
         }
     }
@@ -437,7 +454,7 @@ impl Value {
                 Ok(RawHashableValue::FrozenSet(SharedFrozen::new(new)))
             }
             Value::Tuple(v) => values_to_raw_hashable(v).map(RawHashableValue::Tuple),
-            Value::Object(o) => o.__hash__()?.into_value().into_raw_hashable(),
+            Value::Object(o) => o.inner().__hash__()?.into_value().into_raw_hashable(),
             _ => Err(Error::Syntax(ErrorCode::ValueNotHashable)),
         }
     }
@@ -560,7 +577,7 @@ impl fmt::Display for Value {
                 }
                 write!(f, "}}")
             }
-            Value::Object(ref o) => write!(f, "{o}"),
+            Value::Object(ref o) => write!(f, "{}", o.inner()),
         }
     }
 }
