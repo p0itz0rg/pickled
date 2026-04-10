@@ -523,11 +523,123 @@ mod value_tests {
     fn bytestring_v2_py3_roundtrip() {
         let original = Value::Bytes(b"123\xff\xfe".to_vec().into());
         let vec: Vec<_> = value_to_vec(&original, SerOptions::new().proto_v2()).unwrap();
-        // Python 3 default deserializer attempts to decode strings
-        let mut de = Deserializer::new(vec.as_slice(), DeOptions::new().decode_strings());
+        let opts = DeOptions::new().decode_utf8();
+        let mut de = Deserializer::new(vec.as_slice(), opts);
         let tripped: Value = de.deserialize_value().unwrap();
         assert_eq!(original, tripped);
         de.end().unwrap();
+    }
+
+    #[test]
+    fn no_decode_keeps_bytes() {
+        let latin1 = b"Gro\xdfer Kurf\xfcrst";
+        let mut pickle = vec![0x80, 0x02];
+        pickle.push(b'U');
+        pickle.push(latin1.len() as u8);
+        pickle.extend_from_slice(latin1);
+        pickle.push(b'.');
+
+        let val = value_from_slice(&pickle, DeOptions::new()).unwrap();
+        assert_eq!(val, Value::Bytes(latin1.to_vec().into()));
+    }
+
+    #[test]
+    fn utf8_only_falls_back_to_bytes() {
+        let latin1 = b"Gro\xdfer Kurf\xfcrst";
+        let mut pickle = vec![0x80, 0x02];
+        pickle.push(b'U');
+        pickle.push(latin1.len() as u8);
+        pickle.extend_from_slice(latin1);
+        pickle.push(b'.');
+
+        let opts = DeOptions::new().decode_utf8();
+        let val = value_from_slice(&pickle, opts).unwrap();
+        assert_eq!(val, Value::Bytes(latin1.to_vec().into()));
+    }
+
+    #[test]
+    fn decode_strings_decodes_latin1() {
+        // decode_strings() = utf8 + latin1, so non-UTF-8 input that would
+        // otherwise stay as Bytes is promoted to String via the latin1 path.
+        let latin1 = b"Gro\xdfer Kurf\xfcrst";
+        let mut pickle = vec![0x80, 0x02];
+        pickle.push(b'U');
+        pickle.push(latin1.len() as u8);
+        pickle.extend_from_slice(latin1);
+        pickle.push(b'.');
+
+        let val = value_from_slice(&pickle, DeOptions::new().decode_strings()).unwrap();
+        let s = val.string_ref().expect("expected String, not Bytes");
+        assert_eq!(s.inner().as_str(), "Großer Kurfürst");
+    }
+
+    #[test]
+    fn decode_strings_prefers_utf8() {
+        // With both decoders enabled, valid UTF-8 must take the utf8 path,
+        // not latin1 -- otherwise high-byte sequences would silently mojibake.
+        let utf8 = b"hello world";
+        let mut pickle = vec![0x80, 0x02];
+        pickle.push(b'U');
+        pickle.push(utf8.len() as u8);
+        pickle.extend_from_slice(utf8);
+        pickle.push(b'.');
+
+        let val = value_from_slice(&pickle, DeOptions::new().decode_strings()).unwrap();
+        assert_eq!(val, Value::String("hello world".to_string().into()));
+    }
+
+    #[test]
+    fn latin1_decoding_grosser_kurfurst() {
+        // "Großer Kurfürst" in latin-1: ß = 0xDF, ü = 0xFC
+        let latin1 = b"Gro\xdfer Kurf\xfcrst";
+        let mut pickle = vec![0x80, 0x02];
+        pickle.push(b'U'); // ShortBinString
+        pickle.push(latin1.len() as u8);
+        pickle.extend_from_slice(latin1);
+        pickle.push(b'.');
+
+        let opts = DeOptions::new().decode_latin1();
+        let val = value_from_slice(&pickle, opts).unwrap();
+        assert_eq!(
+            val,
+            Value::String("Gro\u{00df}er Kurf\u{00fc}rst".to_string().into())
+        );
+        let s = val.string_ref().expect("expected String");
+        assert_eq!(s.inner().as_str(), "Großer Kurfürst");
+    }
+
+    #[test]
+    fn latin1_decoding_all_high_bytes() {
+        let all_bytes: Vec<u8> = (0u8..=255).collect();
+        let mut pickle = vec![0x80, 0x02];
+        pickle.push(b'T'); // BinString (i32 length prefix)
+        pickle.extend_from_slice(&(all_bytes.len() as i32).to_le_bytes());
+        pickle.extend_from_slice(&all_bytes);
+        pickle.push(b'.');
+
+        let opts = DeOptions::new().decode_latin1();
+        let val = value_from_slice(&pickle, opts).unwrap();
+        let s = val.string_ref().expect("expected String");
+        assert_eq!(s.inner().chars().count(), 256);
+        // Latin-1 -> Unicode is the identity map on codepoints 0x00..=0xFF.
+        for (i, ch) in s.inner().chars().enumerate() {
+            assert_eq!(ch as u32, i as u32, "byte {i:#04x}");
+        }
+    }
+
+    #[test]
+    fn binunicode_rejects_invalid_utf8() {
+        // BINUNICODE carries UTF-8 data from Python str objects, so
+        // invalid UTF-8 here is a broken pickle regardless of decode opts.
+        let bad = b"\xdf\xfc";
+        let mut pickle = vec![0x80, 0x02];
+        pickle.push(b'X'); // BinUnicode
+        pickle.extend_from_slice(&(bad.len() as u32).to_le_bytes());
+        pickle.extend_from_slice(bad);
+        pickle.push(b'.');
+
+        assert!(value_from_slice(&pickle, DeOptions::new()).is_err());
+        assert!(value_from_slice(&pickle, DeOptions::new().decode_strings()).is_err());
     }
 
     #[test]

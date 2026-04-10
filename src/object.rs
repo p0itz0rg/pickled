@@ -12,13 +12,13 @@ use crate::value::Shared;
 use crate::value::SharedFrozen;
 use crate::value::Value;
 
-/// Result of `__reduce__` — describes how to serialize/reconstruct a Python object.
+/// Result of `__reduce__` -- describes how to serialize/reconstruct a Python object.
 ///
 /// Mirrors Python's `__reduce__` protocol. The pickle serializer emits:
-/// 1. `GLOBAL module.class` + `args` + `NEWOBJ` — to recreate the object
-/// 2. `state` + `BUILD` — to restore state (if `state` is `Some`)
-/// 3. `APPENDS` — to append list items (if `list_items` is `Some`)
-/// 4. `SETITEMS` — to set dict items (if `dict_items` is `Some`)
+/// 1. `GLOBAL module.class` + `args` + `NEWOBJ` -- to recreate the object
+/// 2. `state` + `BUILD` -- to restore state (if `state` is `Some`)
+/// 3. `APPENDS` -- to append list items (if `list_items` is `Some`)
+/// 4. `SETITEMS` -- to set dict items (if `dict_items` is `Some`)
 pub struct ReduceResult {
     /// Python module name (e.g. `"__main__"`).
     pub module: String,
@@ -50,7 +50,7 @@ impl ReduceResult {
 pub trait PickleObject: fmt::Debug + fmt::Display {
     /// `__setstate__`: called by the BUILD opcode to restore object state.
     ///
-    /// In CPython, BUILD first checks for `__setstate__` — if present, it calls
+    /// In CPython, BUILD first checks for `__setstate__` -- if present, it calls
     /// `__setstate__(state)` and returns. Otherwise it falls back to updating
     /// `__dict__` directly and applying slot state via `setattr`.
     ///

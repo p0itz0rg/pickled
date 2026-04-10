@@ -146,52 +146,142 @@ impl PartialEq for Value {
 impl Eq for Value {}
 
 /// Options for deserializing.
-#[derive(Default)]
+///
+/// # String decoding
+///
+/// Python 2 byte strings (`SHORT_BINSTRING`, `BINSTRING`, `STRING` opcodes)
+/// are raw byte sequences whose encoding depends on the producing application.
+/// By default they are kept as `Value::Bytes`. You can enable decoders that
+/// are tried in order until one succeeds:
+///
+/// 1. **UTF-8** ([`decode_utf8`](DeOptions::decode_utf8)) -- free, lossless for valid UTF-8
+/// 2. **Custom encoding** ([`decode_encoding`](DeOptions::decode_encoding)) -- via `encoding_rs` (requires `encoding` feature)
+/// 3. **Latin-1** ([`decode_latin1`](DeOptions::decode_latin1)) -- always succeeds (every byte is valid)
+/// 4. Fall back to `Value::Bytes`
+///
+/// The convenience method [`decode_strings`](DeOptions::decode_strings) enables
+/// both UTF-8 and latin-1, which handles the vast majority of pickle files.
+///
+/// Unicode opcodes (`BINUNICODE`, `SHORT_BINUNICODE`) are always decoded as
+/// UTF-8 regardless of these settings.
 pub struct DeOptions {
-    decode_strings: bool,
+    decode_utf8: bool,
+    decode_latin1: bool,
+    #[cfg(feature = "encoding")]
+    fallback_encodings: Vec<&'static encoding_rs::Encoding>,
     replace_unresolved_globals: bool,
     replace_recursive_structures: bool,
     replace_reconstructor_objects_with_dict: bool,
     object_factory: Option<ObjectFactory>,
 }
 
+impl Default for DeOptions {
+    fn default() -> Self {
+        DeOptions {
+            decode_utf8: false,
+            decode_latin1: false,
+            #[cfg(feature = "encoding")]
+            fallback_encodings: Vec::new(),
+            replace_unresolved_globals: false,
+            replace_recursive_structures: false,
+            replace_reconstructor_objects_with_dict: false,
+            object_factory: None,
+        }
+    }
+}
+
 impl fmt::Debug for DeOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DeOptions")
-            .field("decode_strings", &self.decode_strings)
-            .field(
-                "replace_unresolved_globals",
-                &self.replace_unresolved_globals,
-            )
-            .field(
-                "replace_recursive_structures",
-                &self.replace_recursive_structures,
-            )
-            .field(
-                "replace_reconstructor_objects_with_dict",
-                &self.replace_reconstructor_objects_with_dict,
-            )
-            .field(
-                "object_factory",
-                &self.object_factory.as_ref().map(|_| "..."),
-            )
-            .finish()
+        let mut s = f.debug_struct("DeOptions");
+        s.field("decode_utf8", &self.decode_utf8)
+            .field("decode_latin1", &self.decode_latin1);
+        #[cfg(feature = "encoding")]
+        s.field(
+            "fallback_encodings",
+            &self
+                .fallback_encodings
+                .iter()
+                .map(|e| e.name())
+                .collect::<Vec<_>>(),
+        );
+        s.field(
+            "replace_unresolved_globals",
+            &self.replace_unresolved_globals,
+        )
+        .field(
+            "replace_recursive_structures",
+            &self.replace_recursive_structures,
+        )
+        .field(
+            "replace_reconstructor_objects_with_dict",
+            &self.replace_reconstructor_objects_with_dict,
+        )
+        .field(
+            "object_factory",
+            &self.object_factory.as_ref().map(|_| "..."),
+        )
+        .finish()
     }
 }
 
 impl DeOptions {
     /// Construct with default options:
     ///
-    /// - don't decode strings saved as STRING opcodes (only protocols 0-2) as UTF-8
+    /// - don't decode byte strings (they stay as `Value::Bytes`)
     /// - don't replace unresolvable globals by `None`
     pub fn new() -> Self {
         Default::default()
     }
 
-    /// Activate decoding strings saved as STRING.
-    pub fn decode_strings(mut self) -> Self {
-        self.decode_strings = true;
+    /// Enable UTF-8 decoding for byte strings.
+    ///
+    /// Byte strings that are valid UTF-8 become `Value::String`.
+    /// Non-UTF-8 data falls through to the next enabled decoder, or
+    /// stays as `Value::Bytes`.
+    pub fn decode_utf8(mut self) -> Self {
+        self.decode_utf8 = true;
         self
+    }
+
+    /// Enable latin-1 (ISO 8859-1) decoding as a fallback.
+    ///
+    /// Latin-1 maps every byte 0x00-0xFF to the Unicode codepoint of the
+    /// same value, so this always succeeds. When enabled, byte strings
+    /// that weren't caught by an earlier decoder always become `Value::String`.
+    pub fn decode_latin1(mut self) -> Self {
+        self.decode_latin1 = true;
+        self
+    }
+
+    /// Add a fallback encoding via [`encoding_rs`].
+    ///
+    /// Requires the `encoding` feature. Can be called multiple times to try
+    /// encodings in order. Tried after UTF-8 but before latin-1.
+    /// Unmappable bytes are replaced with U+FFFD.
+    #[cfg(feature = "encoding")]
+    pub fn decode_encoding(mut self, encoding: &'static encoding_rs::Encoding) -> Self {
+        self.fallback_encodings.push(encoding);
+        self
+    }
+
+    /// Append multiple fallback encodings at once.
+    ///
+    /// Equivalent to calling [`decode_encoding`](Self::decode_encoding) for
+    /// each entry. Encodings are tried in slice order, after UTF-8 but
+    /// before latin-1.
+    #[cfg(feature = "encoding")]
+    pub fn decode_encodings(mut self, encodings: &[&'static encoding_rs::Encoding]) -> Self {
+        self.fallback_encodings.reserve(encodings.len());
+        self.fallback_encodings.extend_from_slice(encodings);
+        self
+    }
+
+    /// Enable UTF-8 + latin-1 decoding (recommended for most pickle files).
+    ///
+    /// Equivalent to `.decode_utf8().decode_latin1()`. Since latin-1
+    /// always succeeds, this guarantees byte strings become `Value::String`.
+    pub fn decode_strings(self) -> Self {
+        self.decode_utf8().decode_latin1()
     }
 
     /// Activate replacing unresolved globals by `None`.
@@ -1125,16 +1215,42 @@ impl<R: Read> Deserializer<R> {
         Ok(Value::String(SharedFrozen::new(result)))
     }
 
-    // Decode a string - either as Unicode or as bytes.
+    // Decode a byte string by trying each enabled decoder in order:
+    // UTF-8 -> custom encodings -> latin-1 -> Bytes
     fn decode_string(&self, string: Vec<u8>) -> Result<Value> {
-        if self.options.decode_strings {
-            self.decode_unicode(string)
-        } else {
-            Ok(Value::Bytes(SharedFrozen::new(string)))
+        let mut bytes = string;
+
+        if self.options.decode_utf8 {
+            match String::from_utf8(bytes) {
+                Ok(v) => return Ok(Value::String(SharedFrozen::new(v))),
+                Err(e) => bytes = e.into_bytes(),
+            }
         }
+
+        #[cfg(feature = "encoding")]
+        for encoding in &self.options.fallback_encodings {
+            let (decoded, _, had_errors) = encoding.decode(&bytes);
+            if !had_errors {
+                return Ok(Value::String(SharedFrozen::new(decoded.into_owned())));
+            }
+        }
+
+        // latin1 can (apparently) be trivially and accurately converted
+        // to utf-8, so if that's enabled, try that as a last resort
+        if self.options.decode_latin1 {
+            let decoded: String = bytes.iter().map(|&b| b as char).collect();
+            return Ok(Value::String(SharedFrozen::new(decoded)));
+        }
+
+        Ok(Value::Bytes(SharedFrozen::new(bytes)))
     }
 
     // Decode a Unicode string from UTF-8.
+    //
+    // Unlike `decode_string`, this errors on invalid UTF-8 rather than
+    // falling back: the calling opcodes (BINUNICODE, SHORT_BINUNICODE,
+    // UNICODE) are defined to carry Python str data, so bad bytes here
+    // mean a broken pickle, not an unknown encoding.
     fn decode_unicode(&self, string: Vec<u8>) -> Result<Value> {
         match String::from_utf8(string) {
             Ok(v) => Ok(Value::String(SharedFrozen::new(v))),
