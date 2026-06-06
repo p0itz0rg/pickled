@@ -379,7 +379,10 @@ mod value_tests {
                     } else {
                         class_obj.__setstate__(pyobj!(d={s="attr" => i=5}));
                     }
-                    map.insert(hpyobj!(i = 7), Value::Object(crate::value::Shared::new(Box::new(class_obj))));
+                    map.insert(
+                        hpyobj!(i = 7),
+                        Value::Object(crate::value::Shared::new(Box::new(class_obj))),
+                    );
                 } else {
                     // _reconstructor path: BUILD replaces standin with state dict
                     if pyver == 2 {

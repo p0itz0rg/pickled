@@ -99,6 +99,8 @@ pub use self::object::ReduceResult;
 pub use num_bigint;
 pub use num_traits;
 
+#[macro_use]
+mod variant_accessors;
 mod consts;
 pub mod de;
 pub mod error;

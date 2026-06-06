@@ -260,7 +260,6 @@ where
 /// we simply put all integers that fit into an i64, and use `BigInt` for the
 /// rest.
 #[derive(Debug)]
-#[cfg_attr(feature = "variantly", derive(variantly::Variantly))]
 pub enum Value {
     /// None
     None,
@@ -335,6 +334,22 @@ impl PartialEq for Value {
     }
 }
 
+variant_accessors!(Value {
+    tuple Bool(bool) => bool;
+    tuple I64(i64) => i64;
+    tuple Int(BigInt) => int;
+    tuple F64(f64) => f64;
+    tuple Bytes(SharedFrozen<Vec<u8>>) => bytes;
+    tuple String(SharedFrozen<String>) => string;
+    tuple List(Shared<Vec<Value>>) => list;
+    tuple Tuple(SharedFrozen<Vec<Value>>) => tuple;
+    tuple Set(Shared<BTreeSet<HashableValue>>) => set;
+    tuple FrozenSet(SharedFrozen<BTreeSet<HashableValue>>) => frozen_set;
+    tuple Dict(Shared<BTreeMap<HashableValue, Value>>) => dict;
+    tuple Object(Shared<Box<dyn PickleObject>>) => object;
+    unit None => none;
+});
+
 /// Represents all primitive builtin Python values that can be contained
 /// in a "hashable" context (i.e., as dictionary keys and set elements).
 ///
@@ -343,7 +358,6 @@ impl PartialEq for Value {
 /// into these B-trees, we implement a consistent ordering between all
 /// the possible types (see below).
 #[derive(Clone, Debug)]
-#[cfg_attr(feature = "variantly", derive(variantly::Variantly))]
 pub enum HashableValue {
     /// None
     None,
@@ -364,6 +378,18 @@ pub enum HashableValue {
     /// Frozen (immutable) set
     FrozenSet(SharedFrozen<BTreeSet<HashableValue>>),
 }
+
+variant_accessors!(HashableValue {
+    tuple Bool(bool) => bool;
+    tuple I64(i64) => i64;
+    tuple Int(BigInt) => int;
+    tuple F64(f64) => f64;
+    tuple Bytes(SharedFrozen<Vec<u8>>) => bytes;
+    tuple String(SharedFrozen<String>) => string;
+    tuple Tuple(SharedFrozen<Vec<HashableValue>>) => tuple;
+    tuple FrozenSet(SharedFrozen<BTreeSet<HashableValue>>) => frozen_set;
+    unit None => none;
+});
 
 fn values_to_raw_hashable(
     values: SharedFrozen<Vec<Value>>,
@@ -840,7 +866,6 @@ fn float_bigint_ord(bi: &BigInt, f: f64) -> Ordering {
 }
 
 #[derive(Clone, PartialEq, Debug)]
-#[cfg_attr(feature = "variantly", derive(variantly::Variantly))]
 pub(crate) enum RawHashableValue {
     /// None
     None,

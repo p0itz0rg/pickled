@@ -11,7 +11,8 @@
 //!   --replace-recursive      Replace recursive structures with None
 //!   --replace-reconstructor  Treat _reconstructor objects as dicts
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::mem;
@@ -19,7 +20,13 @@ use std::process;
 use std::rc::Rc;
 use std::time::Instant;
 
-use pickled::{self, DeOptions, HashableValue, PickleObject, Value};
+use pickled::DeOptions;
+use pickled::HashableValue;
+use pickled::PickleObject;
+use pickled::Value;
+use pickled::{
+    self,
+};
 
 // ---------------------------------------------------------------------------
 // RSS measurement
@@ -183,7 +190,10 @@ impl ValueStats {
                 } else {
                     self.shared_strings += 1;
                 }
-                *self.string_content_map.entry(s.inner().clone()).or_insert(0) += 1;
+                *self
+                    .string_content_map
+                    .entry(s.inner().clone())
+                    .or_insert(0) += 1;
             }
             Value::List(l) => {
                 self.count_list += 1;
@@ -296,7 +306,10 @@ impl ValueStats {
                 } else {
                     self.shared_strings += 1;
                 }
-                *self.string_content_map.entry(s.inner().clone()).or_insert(0) += 1;
+                *self
+                    .string_content_map
+                    .entry(s.inner().clone())
+                    .or_insert(0) += 1;
             }
             HashableValue::Tuple(t) => {
                 self.count_tuple += 1;
@@ -372,12 +385,42 @@ impl ValueStats {
     fn report_sharing(&self) {
         println!("\nRc sharing (unique / shared references):");
         let items: &[(&str, u64, u64, u64)] = &[
-            ("Strings", self.unique_strings, self.shared_strings, self.count_string),
-            ("Bytes", self.unique_bytes, self.shared_bytes, self.count_bytes),
-            ("Tuples", self.unique_tuples, self.shared_tuples, self.count_tuple),
-            ("Lists", self.unique_lists, self.shared_lists, self.count_list),
-            ("Dicts", self.unique_dicts, self.shared_dicts, self.count_dict),
-            ("Objects", self.unique_objects, self.shared_objects, self.count_object),
+            (
+                "Strings",
+                self.unique_strings,
+                self.shared_strings,
+                self.count_string,
+            ),
+            (
+                "Bytes",
+                self.unique_bytes,
+                self.shared_bytes,
+                self.count_bytes,
+            ),
+            (
+                "Tuples",
+                self.unique_tuples,
+                self.shared_tuples,
+                self.count_tuple,
+            ),
+            (
+                "Lists",
+                self.unique_lists,
+                self.shared_lists,
+                self.count_list,
+            ),
+            (
+                "Dicts",
+                self.unique_dicts,
+                self.shared_dicts,
+                self.count_dict,
+            ),
+            (
+                "Objects",
+                self.unique_objects,
+                self.shared_objects,
+                self.count_object,
+            ),
         ];
         for (name, unique, shared, count) in items {
             if *count > 0 {
@@ -403,11 +446,18 @@ impl ValueStats {
             }
             let with_dupes: Vec<_> = content_map.iter().filter(|&(_, c)| *c > 1).collect();
             let duped_refs: u64 = with_dupes.iter().map(|(_, c)| **c).sum();
-            let wasted: usize = with_dupes.iter().map(|(s, c)| s.len() * (**c as usize - 1)).sum();
+            let wasted: usize = with_dupes
+                .iter()
+                .map(|(s, c)| s.len() * (**c as usize - 1))
+                .sum();
             println!("\n{label} content-level duplication:");
             println!("  Total refs:            {}", total_refs);
             println!("  Unique content:        {}", content_map.len());
-            println!("  Contents appearing >1: {} (covering {} refs)", with_dupes.len(), duped_refs);
+            println!(
+                "  Contents appearing >1: {} (covering {} refs)",
+                with_dupes.len(),
+                duped_refs
+            );
             println!("  Wasted if not Rc-shared: {:.2} MB", mb(wasted));
 
             let mut top: Vec<_> = with_dupes;
@@ -415,7 +465,11 @@ impl ValueStats {
             if !top.is_empty() {
                 println!("  Top 20 most duplicated:");
                 for (s, count) in top.iter().take(20) {
-                    let display = if s.len() > 60 { format!("{}...", &s[..60]) } else { s.to_string() };
+                    let display = if s.len() > 60 {
+                        format!("{}...", &s[..60])
+                    } else {
+                        s.to_string()
+                    };
                     println!("    {:>8}x  {:>6}B  {:?}", count, s.len(), display);
                 }
             }
@@ -424,13 +478,24 @@ impl ValueStats {
         // Bytes content
         let total_refs: u64 = self.bytes_content_map.values().sum();
         if total_refs > 0 {
-            let with_dupes: Vec<_> = self.bytes_content_map.iter().filter(|&(_, c)| *c > 1).collect();
+            let with_dupes: Vec<_> = self
+                .bytes_content_map
+                .iter()
+                .filter(|&(_, c)| *c > 1)
+                .collect();
             let duped_refs: u64 = with_dupes.iter().map(|(_, c)| **c).sum();
-            let wasted: usize = with_dupes.iter().map(|(b, c)| b.len() * (**c as usize - 1)).sum();
+            let wasted: usize = with_dupes
+                .iter()
+                .map(|(b, c)| b.len() * (**c as usize - 1))
+                .sum();
             println!("\nBytes content-level duplication:");
             println!("  Total refs:            {}", total_refs);
             println!("  Unique content:        {}", self.bytes_content_map.len());
-            println!("  Contents appearing >1: {} (covering {} refs)", with_dupes.len(), duped_refs);
+            println!(
+                "  Contents appearing >1: {} (covering {} refs)",
+                with_dupes.len(),
+                duped_refs
+            );
             println!("  Wasted if not Rc-shared: {:.2} MB", mb(wasted));
 
             let mut top: Vec<_> = with_dupes;
@@ -450,7 +515,10 @@ impl ValueStats {
         println!("  Total objects:         {}", self.count_object);
         println!("  Unique (by Rc):        {}", self.unique_objects);
         println!("  Shared refs:           {}", self.shared_objects);
-        println!("  Total state entries:   {}", self.object_state_entries_total);
+        println!(
+            "  Total state entries:   {}",
+            self.object_state_entries_total
+        );
         if self.unique_objects > 0 {
             println!(
                 "  Avg entries/object:    {:.1}",
@@ -491,40 +559,47 @@ impl ValueStats {
         let node_overhead = value_size * total as usize;
         println!(
             "  Value enum nodes:      {:.2} MB  ({} nodes * {} B)",
-            mb(node_overhead), total, value_size
+            mb(node_overhead),
+            total,
+            value_size
         );
 
         let list_backing = self.total_list_elements as usize * value_size;
         println!(
             "  List Vec backing:      {:.2} MB  ({} elements)",
-            mb(list_backing), self.total_list_elements
+            mb(list_backing),
+            self.total_list_elements
         );
 
         let tuple_backing = self.total_tuple_elements as usize * value_size;
         println!(
             "  Tuple Vec backing:     {:.2} MB  ({} elements)",
-            mb(tuple_backing), self.total_tuple_elements
+            mb(tuple_backing),
+            self.total_tuple_elements
         );
 
         let dict_kv_size = self.total_dict_entries as usize * (hashable_size + value_size);
         let dict_btree = self.total_dict_entries as usize * btree_entry_overhead;
         println!(
             "  Dict storage:          {:.2} MB  ({} entries, kv + BTree overhead)",
-            mb(dict_kv_size + dict_btree), self.total_dict_entries
+            mb(dict_kv_size + dict_btree),
+            self.total_dict_entries
         );
 
-        let obj_struct_size = mem::size_of::<Box<dyn PickleObject>>()
-            + mem::size_of::<pickled::object::DictObject>();
+        let obj_struct_size =
+            mem::size_of::<Box<dyn PickleObject>>() + mem::size_of::<pickled::object::DictObject>();
         let obj_box_overhead = self.unique_objects as usize * obj_struct_size;
         let obj_btree = self.object_state_entries_total as usize * btree_entry_overhead;
         let obj_kv = self.object_state_entries_total as usize * (hashable_size + value_size);
         println!(
             "  Object structs:        {:.2} MB  ({} unique objects)",
-            mb(obj_box_overhead), self.unique_objects
+            mb(obj_box_overhead),
+            self.unique_objects
         );
         println!(
             "  Object state storage:  {:.2} MB  ({} entries, kv + BTree overhead)",
-            mb(obj_kv + obj_btree), self.object_state_entries_total
+            mb(obj_kv + obj_btree),
+            self.object_state_entries_total
         );
 
         let rc_overhead = 24usize;
@@ -550,10 +625,7 @@ impl ValueStats {
             + self.bytes_strings
             + self.bytes_bigint
             + self.object_module_class_bytes;
-        println!(
-            "\n  ESTIMATED TOTAL:       {:.2} MB",
-            mb(est_total)
-        );
+        println!("\n  ESTIMATED TOTAL:       {:.2} MB", mb(est_total));
     }
 }
 

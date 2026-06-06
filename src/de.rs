@@ -164,6 +164,7 @@ impl Eq for Value {}
 ///
 /// Unicode opcodes (`BINUNICODE`, `SHORT_BINUNICODE`) are always decoded as
 /// UTF-8 regardless of these settings.
+#[derive(Default)]
 pub struct DeOptions {
     decode_utf8: bool,
     decode_latin1: bool,
@@ -173,21 +174,6 @@ pub struct DeOptions {
     replace_recursive_structures: bool,
     replace_reconstructor_objects_with_dict: bool,
     object_factory: Option<ObjectFactory>,
-}
-
-impl Default for DeOptions {
-    fn default() -> Self {
-        DeOptions {
-            decode_utf8: false,
-            decode_latin1: false,
-            #[cfg(feature = "encoding")]
-            fallback_encodings: Vec::new(),
-            replace_unresolved_globals: false,
-            replace_recursive_structures: false,
-            replace_reconstructor_objects_with_dict: false,
-            object_factory: None,
-        }
-    }
 }
 
 impl fmt::Debug for DeOptions {
