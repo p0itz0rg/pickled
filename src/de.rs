@@ -63,11 +63,10 @@ enum Global {
     Int,           // builtins/__builtin__.int
     Encode,        // _codecs.encode
     Reconstructor, // copy_reg._reconstructor
-    // anything else (may be a classobj that is later discarded)
-    Other {
-        modname: Cow<'static, str>,
-        globname: Cow<'static, str>,
-    },
+    // anything else (may be a classobj that is later discarded). Boxed to keep
+    // `Global` (and thus every `de::Value` slot in the transient tree) small;
+    // this variant is rare relative to the millions of other nodes.
+    Other(Box<(Cow<'static, str>, Cow<'static, str>)>),
 }
 
 /// Our intermediate representation of a value.
@@ -86,7 +85,7 @@ enum Value {
     None,
     Bool(bool),
     I64(i64),
-    Int(BigInt),
+    Int(Box<BigInt>),
     F64(f64),
     Bytes(SharedFrozen<Vec<u8>>),
     String(SharedFrozen<String>),
@@ -755,8 +754,8 @@ impl<R: Read> Deserializer<R> {
                     };
                     let cls = self.resolve(Some(cls));
                     let (modname, globname) = match &cls {
-                        Some(Value::Global(Global::Other { modname, globname })) => {
-                            (modname.as_ref(), globname.as_ref())
+                        Some(Value::Global(Global::Other(names))) => {
+                            (names.0.as_ref(), names.1.as_ref())
                         }
                         _ => {
                             return Self::stack_error(
@@ -773,8 +772,8 @@ impl<R: Read> Deserializer<R> {
                     let _args = self.pop()?;
                     let cls = self.pop_resolve()?;
                     let (modname, globname) = match &cls {
-                        Value::Global(Global::Other { modname, globname }) => {
-                            (modname.as_ref(), globname.as_ref())
+                        Value::Global(Global::Other(names)) => {
+                            (names.0.as_ref(), names.1.as_ref())
                         }
                         _ => return Self::stack_error("global reference", &cls, self.pos),
                     };
@@ -786,8 +785,8 @@ impl<R: Read> Deserializer<R> {
                     let _args = self.pop()?;
                     let cls = self.pop_resolve()?;
                     let (modname, globname) = match &cls {
-                        Value::Global(Global::Other { modname, globname }) => {
-                            (modname.as_ref(), globname.as_ref())
+                        Value::Global(Global::Other(names)) => {
+                            (names.0.as_ref(), names.1.as_ref())
                         }
                         _ => return Self::stack_error("global reference", &cls, self.pos),
                     };
@@ -1117,7 +1116,7 @@ impl<R: Read> Deserializer<R> {
             line.pop();
         }
         match BigInt::parse_bytes(&line, 10) {
-            Some(i) => Ok(Value::Int(i)),
+            Some(i) => Ok(Value::Int(Box::new(i))),
             None => self.error(ErrorCode::InvalidLiteral(line)),
         }
     }
@@ -1253,7 +1252,7 @@ impl<R: Read> Deserializer<R> {
         if negative {
             val -= BigInt::from(1) << (bytes.len() * 8);
         }
-        Value::Int(val)
+        Value::Int(Box::new(val))
     }
 
     /// Create an object using the factory callback, or fall back to DictObject.
@@ -1294,7 +1293,7 @@ impl<R: Read> Deserializer<R> {
                 if let Some(i) = i.to_i64() {
                     value::Value::I64(i)
                 } else {
-                    value::Value::Int(Box::new(i))
+                    value::Value::Int(i)
                 }
             }
             Value::F64(f) => value::Value::F64(f),
@@ -1495,10 +1494,7 @@ impl<R: Read> Deserializer<R> {
                 let globname = String::from_utf8(globname)
                     .map_err(|_| self.inner_error(ErrorCode::StringNotUTF8))?;
 
-                Value::Global(Global::Other {
-                    modname: Cow::Owned(modname),
-                    globname: Cow::Owned(globname),
-                })
+                Value::Global(Global::Other(Box::new((Cow::Owned(modname), Cow::Owned(globname)))))
             }
         };
         Ok(value)
@@ -1583,8 +1579,8 @@ impl<R: Read> Deserializer<R> {
                     || self.options.replace_reconstructor_objects_with_dict
                 {
                     let (modname, globname) = match &cls {
-                        Some(Value::Global(Global::Other { modname, globname })) => {
-                            (modname.as_ref(), globname.as_ref())
+                        Some(Value::Global(Global::Other(names))) => {
+                            (names.0.as_ref(), names.1.as_ref())
                         }
                         _ => {
                             return Self::stack_error(
@@ -1599,19 +1595,18 @@ impl<R: Read> Deserializer<R> {
                 } else {
                     // If the user doesn't want to replace reconstructor objects, transition this to an unresolved global
                     // so that we can bubble up unresolved global errors.
-                    self.stack.push(Value::Global(Global::Other {
-                        modname: Cow::Borrowed("copy_reg"),
-                        globname: Cow::Borrowed("_reconstructor"),
-                    }));
+                    self.stack.push(Value::Global(Global::Other(Box::new((
+                        Cow::Borrowed("copy_reg"),
+                        Cow::Borrowed("_reconstructor"),
+                    )))));
                 }
                 Ok(())
             }
-            Value::Global(Global::Other { modname, globname }) => {
+            Value::Global(Global::Other(names)) => {
                 // Anything else; just keep it on the stack as an opaque object.
                 // If it is a class object, it will get replaced later when the
                 // class is instantiated.
-                self.stack
-                    .push(Value::Global(Global::Other { modname, globname }));
+                self.stack.push(Value::Global(Global::Other(names)));
                 Ok(())
             }
             other => Self::stack_error("global reference", &other, self.pos),
@@ -1640,7 +1635,7 @@ impl<R: Read> Deserializer<R> {
                 if let Some(i) = v.to_i64() {
                     Ok(value::Value::I64(i))
                 } else {
-                    Ok(value::Value::Int(Box::new(v)))
+                    Ok(value::Value::Int(v))
                 }
             }
             Value::F64(v) => Ok(value::Value::F64(v)),
