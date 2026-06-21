@@ -87,6 +87,7 @@ pub use self::de::value_from_slice;
 pub use self::value::Dict;
 pub use self::value::HashableValue;
 pub use self::value::Value;
+pub use self::value::WeakValue;
 pub use self::value::from_value;
 pub use self::value::to_value;
 

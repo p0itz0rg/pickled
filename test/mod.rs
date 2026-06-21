@@ -416,57 +416,69 @@ mod value_tests {
         assert_eq!(dict, tripped);
     }
 
+    // The test pickles encode a recursive structure shaped as
+    // `List[ Tuple([ List([ <back-edge> ]) ]) ]`. The back-edge lives in the
+    // innermost (mutable) list. `f` inspects that slot. Default options now make
+    // it a `Value::Weak` (navigable, leak-free) rather than the old
+    // `Err(Recursive)`.
+    fn with_back_edge(value: Value, f: impl FnOnce(&Value)) {
+        let outer = value.list_ref().expect("outer list");
+        let outer_i = outer.inner();
+        let tup = outer_i[0].tuple_ref().expect("tuple");
+        let tup_i = tup.inner();
+        let inner = tup_i[0].list_ref().expect("inner list");
+        let inner_i = inner.inner();
+        assert_eq!(inner_i.len(), 1, "inner list holds one back-edge");
+        f(&inner_i[0]);
+    }
+
     #[test]
     fn recursive() {
         for proto in &[0, 1, 2, 3, 4, 5] {
             let file =
                 File::open(format!("test/data/test_recursive_proto{}.pickle", proto)).unwrap();
-            match value_from_reader(file, Default::default()) {
-                Err(Error::Syntax(ErrorCode::Recursive)) => {}
-                Ok(value) => {
-                    let list = value.list_ref().expect("recursive structure is not a list");
-                    let list_inner = list.inner();
+            let value = value_from_reader(file, Default::default())
+                .unwrap_or_else(|e| panic!("proto {proto}: {e:?}"));
+            with_back_edge(value, |slot| match slot {
+                Value::Weak(w) => {
                     assert!(
-                        list_inner.is_empty(),
-                        "recursive list structure is not empty"
+                        w.upgrade().is_some(),
+                        "weak back-edge should still be alive"
                     );
                 }
-                value => {
-                    panic!(
-                        "wrong/no error returned for recursive structure, {:?}",
-                        value
-                    );
-                }
-            }
+                other => panic!("expected weak back-edge, got {other:?}"),
+            });
         }
     }
 
     #[test]
-    fn recursive_with_replace_reconstructor() {
+    fn recursive_with_replace() {
+        // With `replace_recursive_structures`, the back-edge becomes `None`.
         for proto in &[0, 1, 2, 3, 4, 5] {
             let file =
                 File::open(format!("test/data/test_recursive_proto{}.pickle", proto)).unwrap();
-            match value_from_reader(
-                file,
-                DeOptions::new().replace_reconstructor_objects_structures(),
-            ) {
-                Err(Error::Syntax(ErrorCode::Recursive)) => {}
-                Ok(value) => {
-                    let list = value.list_ref().expect("recursive structure is not a list");
-                    let list_inner = list.inner();
-                    assert!(
-                        list_inner.is_empty(),
-                        "recursive list structure is not empty"
-                    );
-                }
-                value => {
-                    panic!(
-                        "wrong/no error returned for recursive structure, {:?}",
-                        value
-                    );
-                }
-            }
+            let value = value_from_reader(file, DeOptions::new().replace_recursive_structures())
+                .unwrap_or_else(|e| panic!("proto {proto}: {e:?}"));
+            with_back_edge(value, |slot| {
+                assert_eq!(*slot, Value::None, "back-edge should be replaced by None");
+            });
         }
+    }
+
+    #[test]
+    fn weak_cycle_upgrades_to_a_live_list() {
+        let data = std::fs::read("test/data/test_recursive_proto2.pickle").unwrap();
+        let value = value_from_slice(&data, Default::default()).unwrap();
+        with_back_edge(value, |slot| match slot {
+            Value::Weak(w) => {
+                let upgraded = w.upgrade().expect("weak still alive");
+                assert!(
+                    matches!(upgraded, Value::List(_)),
+                    "weak back-edge upgrades to the recursive list"
+                );
+            }
+            other => panic!("expected weak back-edge, got {other:?}"),
+        });
     }
 
     #[test]

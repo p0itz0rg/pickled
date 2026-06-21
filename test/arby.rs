@@ -145,6 +145,7 @@ impl Arbitrary for Value {
                 )
             }
             Value::Object(_) => empty_shrinker(),
+            Value::Weak(_) => empty_shrinker(),
         }
     }
 }

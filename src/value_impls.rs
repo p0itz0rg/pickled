@@ -315,6 +315,13 @@ impl<'de: 'a, 'a> de::Deserializer<'de> for &'a mut Deserializer {
                 self.value = Some(o.inner().__reduce__().state_or_none());
                 self.deserialize_any(visitor)
             }
+            Value::Weak(w) => match w.upgrade() {
+                Some(v) => {
+                    self.value = Some(v);
+                    self.deserialize_any(visitor)
+                }
+                None => visitor.visit_unit(),
+            },
         }
     }
 

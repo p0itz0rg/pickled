@@ -255,6 +255,8 @@ impl ValueStats {
                     self.shared_objects += 1;
                 }
             }
+            // Recursive back-edge: do not follow (would re-enter the cycle).
+            Value::Weak(_) => {}
         }
     }
 

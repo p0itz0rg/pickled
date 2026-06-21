@@ -25,6 +25,7 @@ use std::borrow::Cow;
 use std::char;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::convert::TryFrom;
 use std::fmt;
 use std::io;
@@ -1421,20 +1422,23 @@ impl<R: Read> Deserializer<R> {
         Error::Eval(reason, self.pos)
     }
 
-    /// Detect reference cycles in the finished value. Identity-memoized DFS
-    /// keyed by container `Rc` pointer, so it visits each unique container once
-    /// (shared subtrees are not re-walked). On a back-edge it errors with
-    /// `Recursive`, unless `replace_recursive_structures` is set (then the cycle
-    /// is tolerated and left as-is). Task 2 will downgrade back-edges to `Weak`.
+    /// Break reference cycles in the finished value so they do not leak.
+    /// Identity-memoized DFS keyed by container `Rc` pointer, visiting each
+    /// unique container once (shared subtrees are not re-walked). A back-edge
+    /// inside a mutable container (`List`/`Dict`) is downgraded to
+    /// `Value::Weak`, or replaced with `None` when `replace_recursive_structures`
+    /// is set. For acyclic data (all real WoWs pickles) it walks once and
+    /// changes nothing.
     fn break_cycles(&mut self, value: &mut V) -> Result<()> {
-        let mut visited: std::collections::HashSet<*const ()> = std::collections::HashSet::new();
-        let mut path: std::collections::HashSet<*const ()> = std::collections::HashSet::new();
-        detect_cycles(
+        let mut visited: HashSet<*const ()> = HashSet::new();
+        let mut path: HashSet<*const ()> = HashSet::new();
+        break_walk(
             value,
             self.options.replace_recursive_structures,
             &mut visited,
             &mut path,
-        )
+        );
+        Ok(())
     }
 }
 
@@ -1452,56 +1456,84 @@ fn container_ptr(v: &V) -> Option<*const ()> {
     }
 }
 
-fn detect_cycles(
+/// Replace a back-edge slot with a `Weak` (or `None`), or recurse into a
+/// non-back-edge child container.
+fn fix_or_recurse(
+    slot: &mut V,
+    replace: bool,
+    visited: &mut HashSet<*const ()>,
+    path: &mut HashSet<*const ()>,
+) {
+    let Some(cptr) = container_ptr(slot) else {
+        return;
+    };
+    if path.contains(&cptr) {
+        *slot = if replace {
+            V::None
+        } else {
+            crate::value::downgrade_value(slot)
+                .map(V::Weak)
+                .unwrap_or(V::None)
+        };
+    } else {
+        break_walk(slot, replace, visited, path);
+    }
+}
+
+fn break_walk(
     v: &V,
     replace: bool,
-    visited: &mut std::collections::HashSet<*const ()>,
-    path: &mut std::collections::HashSet<*const ()>,
-) -> Result<()> {
+    visited: &mut HashSet<*const ()>,
+    path: &mut HashSet<*const ()>,
+) {
     let Some(ptr) = container_ptr(v) else {
-        return Ok(());
+        return;
     };
-    if path.contains(&ptr) {
-        return if replace {
-            Ok(())
-        } else {
-            Err(Error::Syntax(ErrorCode::Recursive))
-        };
-    }
     if !visited.insert(ptr) {
-        return Ok(());
+        return;
     }
     path.insert(ptr);
     match v {
         V::List(s) => {
-            for c in s.inner().iter() {
-                detect_cycles(c, replace, visited, path)?;
-            }
-        }
-        V::Tuple(s) => {
-            for c in s.inner().iter() {
-                detect_cycles(c, replace, visited, path)?;
+            for slot in s.inner_mut().iter_mut() {
+                fix_or_recurse(slot, replace, visited, path);
             }
         }
         V::Dict(s) => {
-            for (_, val) in s.inner().iter() {
-                detect_cycles(val, replace, visited, path)?;
+            for slot in s.inner_mut().values_mut() {
+                fix_or_recurse(slot, replace, visited, path);
             }
         }
-        V::Object(s) => {
-            let inner = s.inner();
-            if let Some(dict_obj) = inner.as_any().downcast_ref::<DictObject>() {
-                for (_, val) in dict_obj.state().iter() {
-                    detect_cycles(val, replace, visited, path)?;
+        // Tuples are immutable: we cannot replace a direct back-edge slot, but we
+        // still recurse to break cycles in nested mutable containers.
+        V::Tuple(s) => {
+            for child in s.inner().iter() {
+                if let Some(cptr) = container_ptr(child)
+                    && !path.contains(&cptr)
+                {
+                    break_walk(child, replace, visited, path);
                 }
             }
         }
-        // Sets/frozensets hold only hashable (immutable) elements, so they can
-        // never participate in a cycle.
+        // Object state is read through the trait; recurse to break cycles in
+        // nested mutable containers (a direct back-edge into object state is
+        // left strong -- only reachable from exotic hand-built pickles).
+        V::Object(s) => {
+            let inner = s.inner();
+            if let Some(dict_obj) = inner.as_any().downcast_ref::<DictObject>() {
+                for (_, child) in dict_obj.state().iter() {
+                    if let Some(cptr) = container_ptr(child)
+                        && !path.contains(&cptr)
+                    {
+                        break_walk(child, replace, visited, path);
+                    }
+                }
+            }
+        }
+        // Sets/frozensets hold only hashable (immutable) elements.
         _ => {}
     }
     path.remove(&ptr);
-    Ok(())
 }
 
 impl<'de: 'a, 'a, R: Read> de::Deserializer<'de> for &'a mut Deserializer<R> {
@@ -1588,6 +1620,14 @@ impl<'de: 'a, 'a, R: Read> de::Deserializer<'de> for &'a mut Deserializer<R> {
                 let mut de = crate::value_impls::Deserializer::new(public_val);
                 serde::de::Deserializer::deserialize_any(&mut de, visitor)
             }
+            // A recursive back-edge: deserialize the live target, else unit.
+            V::Weak(w) => match w.upgrade() {
+                Some(v) => {
+                    self.value = Some(v);
+                    self.deserialize_any(visitor)
+                }
+                None => visitor.visit_unit(),
+            },
         }
     }
 

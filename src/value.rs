@@ -69,6 +69,16 @@ impl<T> Shared<T> {
     pub fn rc_ptr(&self) -> *const T {
         self.0.as_ptr()
     }
+
+    /// Downgrade to a non-owning `Weak` handle (used to break reference cycles).
+    pub fn downgrade(&self) -> std::rc::Weak<RefCell<T>> {
+        Rc::downgrade(&self.0)
+    }
+
+    /// Rebuild a `Shared` from a strong `Rc` and a stable id.
+    pub(crate) fn from_rc(rc: Rc<RefCell<T>>, id: u64) -> Self {
+        Shared(rc, id)
+    }
 }
 
 impl<T: fmt::Debug> fmt::Debug for Shared<T> {
@@ -148,11 +158,11 @@ where
 }
 
 #[derive(Clone)]
-pub struct SharedFrozen<T>(Rc<T>, u64);
+pub struct SharedFrozen<T>(Rc<T>);
 
 impl<T> SharedFrozen<T> {
     pub fn new(value: T) -> Self {
-        SharedFrozen(Rc::new(value), next_id())
+        SharedFrozen(Rc::new(value))
     }
 
     pub fn inner(&self) -> &T {
@@ -162,10 +172,6 @@ impl<T> SharedFrozen<T> {
     /// Returns true if two `SharedFrozen` values point to the same allocation.
     pub fn ptr_eq(&self, other: &Self) -> bool {
         Rc::ptr_eq(&self.0, &other.0)
-    }
-
-    pub(crate) fn stable_id(&self) -> u64 {
-        self.1
     }
 
     /// Returns a reference to the inner `Rc<T>`.
@@ -457,6 +463,60 @@ pub enum Value {
     Dict(Shared<Dict>),
     /// Python object reconstructed during unpickling
     Object(Shared<Box<dyn PickleObject>>),
+    /// A non-owning back-edge into a container, produced only when unpickling a
+    /// recursive structure (a cycle). Stored as a `Weak` reference so the cycle
+    /// does not leak; `upgrade` recovers the target if still alive. Never
+    /// appears in acyclic data.
+    Weak(WeakValue),
+}
+
+/// The target of a [`Value::Weak`] back-edge. Only the mutable container kinds
+/// (`List`, `Dict`, `Object`) can participate in a cycle; immutable values and
+/// sets cannot reference themselves.
+#[derive(Clone)]
+pub enum WeakValue {
+    List(std::rc::Weak<RefCell<Vec<Value>>>, u64),
+    Dict(std::rc::Weak<RefCell<Dict>>, u64),
+    Object(std::rc::Weak<RefCell<Box<dyn PickleObject>>>, u64),
+}
+
+impl WeakValue {
+    /// Recover the strong [`Value`] this back-edge points at, if still alive.
+    pub fn upgrade(&self) -> Option<Value> {
+        match self {
+            WeakValue::List(w, id) => w.upgrade().map(|rc| Value::List(Shared::from_rc(rc, *id))),
+            WeakValue::Dict(w, id) => w.upgrade().map(|rc| Value::Dict(Shared::from_rc(rc, *id))),
+            WeakValue::Object(w, id) => w
+                .upgrade()
+                .map(|rc| Value::Object(Shared::from_rc(rc, *id))),
+        }
+    }
+
+    /// Pointer identity of the target.
+    pub fn as_ptr(&self) -> *const () {
+        match self {
+            WeakValue::List(w, _) => w.as_ptr() as *const (),
+            WeakValue::Dict(w, _) => w.as_ptr() as *const (),
+            WeakValue::Object(w, _) => w.as_ptr() as *const (),
+        }
+    }
+}
+
+impl fmt::Debug for WeakValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "WeakValue(<cycle back-edge>)")
+    }
+}
+
+/// Downgrade a `Value` container into the matching [`WeakValue`]; returns `None`
+/// for non-container values (which cannot be cycle targets).
+pub(crate) fn downgrade_value(v: &Value) -> Option<WeakValue> {
+    match v {
+        Value::List(s) => Some(WeakValue::List(s.downgrade(), s.stable_id())),
+        Value::Dict(s) => Some(WeakValue::Dict(s.downgrade(), s.stable_id())),
+        Value::Object(s) => Some(WeakValue::Object(s.downgrade(), s.stable_id())),
+        _ => None,
+    }
 }
 
 impl Clone for Value {
@@ -475,6 +535,7 @@ impl Clone for Value {
             Value::FrozenSet(s) => Value::FrozenSet(s.clone()),
             Value::Dict(d) => Value::Dict(d.clone()),
             Value::Object(o) => Value::Object(o.clone()),
+            Value::Weak(w) => Value::Weak(w.clone()),
         }
     }
 }
@@ -517,6 +578,7 @@ variant_accessors!(Value {
     tuple FrozenSet(SharedFrozen<BTreeSet<HashableValue>>) => frozen_set;
     tuple Dict(Shared<Dict>) => dict;
     tuple Object(Shared<Box<dyn PickleObject>>) => object;
+    tuple Weak(WeakValue) => weak;
     unit None => none;
 });
 
@@ -774,6 +836,7 @@ impl fmt::Display for Value {
                 write!(f, "}}")
             }
             Value::Object(ref o) => write!(f, "{}", o.inner()),
+            Value::Weak(_) => write!(f, "..."),
         }
     }
 }
