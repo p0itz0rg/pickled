@@ -39,18 +39,19 @@ use std::vec;
 
 use crate::object::DictObject;
 use crate::object::ObjectFactory;
-use crate::object::PickleObject;
+use crate::value::Dict;
+use crate::value::HashableValue;
 use crate::value::RawHashableValue;
 use crate::value::Shared;
 use crate::value::SharedFrozen;
+use crate::value::Value as V;
+use std::collections::BTreeSet;
 
 use super::consts::*;
 use super::error::Error;
 use super::error::ErrorCode;
 use super::error::Result;
 use super::value;
-
-const MEMO_REF_COUNTING: bool = false;
 
 type MemoId = u32;
 
@@ -71,78 +72,46 @@ enum Global {
 
 /// Our intermediate representation of a value.
 ///
-/// The most striking difference to `value::Value` is that it contains a variant
-/// for `MemoRef`, which references values put into the "memo" map, and a variant
-/// for module globals that we support.
+/// A stack/memo entry during single-pass unpickling.
 ///
-/// We also don't use sets and maps at the Rust level, since they are not
-/// needed: nothing is ever looked up in them at this stage, and Vecs are much
-/// tighter in memory.
-#[derive(Debug)]
-enum Value {
-    MemoRef(MemoId),
+/// The opcode loop builds public `value::Value`s directly; the only non-value
+/// thing that ever lives on the stack is a module `Global` (a callable/class
+/// marker consumed by REDUCE/NEWOBJ). There is no `MemoRef` variant: `GET`
+/// pushes a clone of the memoized item (an `Rc` clone for containers, so
+/// identity is preserved and in-place `APPEND`/`SETITEM` mutate the shared
+/// instance, exactly as CPython relies on).
+#[derive(Clone, Debug)]
+enum Item {
     Global(Global),
-    None,
-    Bool(bool),
-    I64(i64),
-    Int(Box<BigInt>),
-    F64(f64),
-    Bytes(SharedFrozen<Vec<u8>>),
-    String(SharedFrozen<String>),
-    List(Shared<Vec<Value>>),
-    Tuple(SharedFrozen<Vec<Value>>),
-    Set(Shared<Vec<Value>>),
-    FrozenSet(SharedFrozen<Vec<Value>>),
-    Dict(Shared<Vec<(Value, Value)>>),
-    Object(Box<dyn PickleObject>),
+    Value(value::Value),
+    // A tuple that still contains at least one bare `Global` (e.g. the args
+    // tuple of a `copy_reg._reconstructor` REDUCE, whose first element is a
+    // class global). Kept transient so REDUCE can recover the globals; if such
+    // a tuple is used as a plain value instead, it lossily becomes a
+    // `Value::Tuple` with each global replaced by `None`.
+    Args(Vec<Item>),
 }
 
-impl Clone for Value {
-    fn clone(&self) -> Self {
+impl Item {
+    /// Unwrap to a public value, mapping a bare global to `None` (matching the
+    /// old converter, which turned an unresolved global inside a container into
+    /// `Value::None`). Used when an item is placed into a container.
+    fn into_value_lossy(self) -> value::Value {
         match self {
-            Value::MemoRef(id) => Value::MemoRef(*id),
-            Value::Global(g) => Value::Global(g.clone()),
-            Value::None => Value::None,
-            Value::Bool(b) => Value::Bool(*b),
-            Value::I64(i) => Value::I64(*i),
-            Value::Int(i) => Value::Int(i.clone()),
-            Value::F64(f) => Value::F64(*f),
-            Value::Bytes(b) => Value::Bytes(b.clone()),
-            Value::String(s) => Value::String(s.clone()),
-            Value::List(l) => Value::List(l.clone()),
-            Value::Tuple(t) => Value::Tuple(t.clone()),
-            Value::Set(s) => Value::Set(s.clone()),
-            Value::FrozenSet(s) => Value::FrozenSet(s.clone()),
-            Value::Dict(d) => Value::Dict(d.clone()),
-            Value::Object(o) => Value::Object(o.clone_dyn()),
+            Item::Value(v) => v,
+            Item::Global(_) => value::Value::None,
+            Item::Args(items) => value::Value::Tuple(SharedFrozen::new(
+                items.into_iter().map(Item::into_value_lossy).collect(),
+            )),
         }
     }
 }
 
-impl PartialEq for Value {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Value::MemoRef(a), Value::MemoRef(b)) => a == b,
-            (Value::Global(a), Value::Global(b)) => a == b,
-            (Value::None, Value::None) => true,
-            (Value::Bool(a), Value::Bool(b)) => a == b,
-            (Value::I64(a), Value::I64(b)) => a == b,
-            (Value::Int(a), Value::Int(b)) => a == b,
-            (Value::F64(a), Value::F64(b)) => a == b,
-            (Value::Bytes(a), Value::Bytes(b)) => a == b,
-            (Value::String(a), Value::String(b)) => a == b,
-            (Value::List(a), Value::List(b)) => a == b,
-            (Value::Tuple(a), Value::Tuple(b)) => a == b,
-            (Value::Set(a), Value::Set(b)) => a == b,
-            (Value::FrozenSet(a), Value::FrozenSet(b)) => a == b,
-            (Value::Dict(a), Value::Dict(b)) => a == b,
-            (Value::Object(a), Value::Object(b)) => a.eq_dyn(b.as_ref()),
-            _ => false,
-        }
+impl From<value::Value> for Item {
+    fn from(v: value::Value) -> Self {
+        Item::Value(v)
     }
 }
-
-impl Eq for Value {}
 
 /// Options for deserializing.
 ///
@@ -303,18 +272,20 @@ pub struct Deserializer<R: Read> {
     rdr: BufReader<R>,
     options: DeOptions,
     pos: usize,
-    value: Option<Value>,                     // next value to deserialize
-    // Pickle memo (value, number of refs), indexed by memo id. A flat Vec
+    value: Option<V>, // next public value to feed the serde visitor (post-parse)
+    // Pickle memo (item, number of refs), indexed by memo id. A flat Vec
     // rather than a BTreeMap: memo ids are dense (MEMOIZE assigns them
     // sequentially; PUT/BINPUT use small explicit ids), so direct indexing
     // avoids the per-node overhead of a BTreeMap over a large memo. Absent
-    // slots are `None` (e.g. after `resolve_recursive` takes a value).
-    memo: Vec<Option<(Value, i32)>>,
-    stack: Vec<Value>,                        // topmost items on the stack
-    stacks: Vec<Vec<Value>>,                  // items further down the stack, between MARKs
-    converted_rc: HashMap<u64, value::Value>, // shared items that have already been converted
-    strings_rc: HashMap<Vec<u8>, Value>,
-    tuple_rc: BTreeMap<Vec<value::RawHashableValue>, Value>,
+    // slots are `None`.
+    memo: Vec<Option<(Item, i32)>>,
+    stack: Vec<Item>,                // topmost items on the stack
+    stacks: Vec<Vec<Item>>,          // items further down the stack, between MARKs
+    strings_rc: HashMap<Vec<u8>, V>, // content-dedup of decoded strings
+    tuple_rc: BTreeMap<Vec<value::RawHashableValue>, V>, // content-dedup of tuples
+    // Set when an unresolved global was demoted to `None` while building a
+    // value. Used to error at the end unless `replace_unresolved_globals`.
+    saw_unresolved_global: bool,
 }
 
 impl<R: Read> Deserializer<R> {
@@ -328,9 +299,9 @@ impl<R: Read> Deserializer<R> {
             stack: Vec::with_capacity(128),
             stacks: Vec::with_capacity(16),
             options,
-            converted_rc: Default::default(),
             strings_rc: Default::default(),
             tuple_rc: Default::default(),
+            saw_unresolved_global: false,
         }
     }
 
@@ -387,83 +358,112 @@ impl<R: Read> Deserializer<R> {
         self.memo.clear();
     }
 
-    fn memo_get(&self, id: MemoId) -> Option<&(Value, i32)> {
+    fn memo_get(&self, id: MemoId) -> Option<&(Item, i32)> {
         self.memo.get(id as usize).and_then(Option::as_ref)
     }
 
-    fn memo_get_mut(&mut self, id: MemoId) -> Option<&mut (Value, i32)> {
-        self.memo.get_mut(id as usize).and_then(Option::as_mut)
-    }
-
     /// Insert (or overwrite) a memo entry, growing the backing vec with `None`
-    /// holes as needed. Returns the previous entry at that id, if any.
-    fn memo_insert(&mut self, id: MemoId, entry: (Value, i32)) -> Option<(Value, i32)> {
+    /// holes as needed.
+    fn memo_insert(&mut self, id: MemoId, entry: (Item, i32)) {
         let idx = id as usize;
         if idx >= self.memo.len() {
             self.memo.resize_with(idx + 1, || None);
         }
-        self.memo[idx].replace(entry)
-    }
-
-    fn memo_remove(&mut self, id: MemoId) -> Option<(Value, i32)> {
-        self.memo.get_mut(id as usize).and_then(Option::take)
+        self.memo[idx] = Some(entry);
     }
 
     /// Decode a Value from this pickle.  This is different from going through
     /// the generic serde `deserialize`, since it preserves some types that are
     /// not in the serde data model, such as big integers.
     pub fn deserialize_value(&mut self) -> Result<value::Value> {
-        let internal_value = self.parse_value()?;
-        self.convert_value(internal_value)
+        let mut value = self.parse_value()?;
+        if self.saw_unresolved_global && !self.options.replace_unresolved_globals {
+            return Err(Error::Syntax(ErrorCode::UnresolvedGlobal));
+        }
+        self.break_cycles(&mut value)?;
+        Ok(value)
+    }
+
+    /// Convert an item to a public value for placement into a container or as
+    /// the result, flagging unresolved globals so the caller can error.
+    fn demote(&mut self, item: Item) -> V {
+        match &item {
+            Item::Global(_) => self.saw_unresolved_global = true,
+            Item::Args(items) if items.iter().any(|i| matches!(i, Item::Global(_))) => {
+                self.saw_unresolved_global = true;
+            }
+            _ => {}
+        }
+        item.into_value_lossy()
     }
 
     /// Get the next value to deserialize, either by parsing the pickle stream
     /// or from `self.value`.
-    fn get_next_value(&mut self) -> Result<Value> {
+    fn get_next_value(&mut self) -> Result<V> {
         match self.value.take() {
             Some(v) => Ok(v),
             None => self.parse_value(),
         }
     }
 
-    fn tuple_from_items(&mut self, items: Vec<Value>) -> Value {
-        let hashable_items = items
+    fn push_val(&mut self, v: V) {
+        self.stack.push(Item::Value(v));
+    }
+
+    fn tuple_from_items(&mut self, items: Vec<Item>) -> Item {
+        // A tuple containing a bare global stays transient so REDUCE can use it.
+        if items
+            .iter()
+            .any(|it| matches!(it, Item::Global(_) | Item::Args(_)))
+        {
+            return Item::Args(items);
+        }
+        let values: Vec<V> = items.into_iter().map(Item::into_value_lossy).collect();
+        // Content-dedup pure-value tuples, matching the old converter's tuple_rc.
+        let hashable: std::result::Result<Vec<RawHashableValue>, _> = values
             .iter()
             .cloned()
-            .map(|de_value| {
-                let converted = self.convert_value(de_value)?;
-                converted.into_raw_hashable()
-            })
-            .collect::<Result<Vec<RawHashableValue>>>();
-
-        if let Ok(hashable_items) = hashable_items {
-            if let Some(cached) = self.tuple_rc.get(&hashable_items) {
-                cached.clone()
-            } else {
-                let value = Value::Tuple(SharedFrozen::new(items.clone()));
-                self.tuple_rc.insert(hashable_items, value.clone());
-
-                value
+            .map(|v| v.into_raw_hashable())
+            .collect();
+        if let Ok(key) = hashable {
+            if let Some(cached) = self.tuple_rc.get(&key) {
+                return Item::Value(cached.clone());
             }
+            let value = V::Tuple(SharedFrozen::new(values));
+            self.tuple_rc.insert(key, value.clone());
+            Item::Value(value)
         } else {
-            Value::Tuple(SharedFrozen::new(items))
+            Item::Value(V::Tuple(SharedFrozen::new(values)))
         }
     }
 
-    fn list_from_items(&mut self, items: Vec<Value>) -> Value {
-        Value::List(Shared::new(items))
+    fn list_from_items(items: Vec<V>) -> V {
+        V::List(Shared::new(items))
     }
 
-    fn dict_from_items(&mut self, items: Vec<Value>) -> Value {
-        let mut dict = Vec::with_capacity(items.len() / 2);
-        Self::extend_dict(&mut dict, items);
-
-        Value::Dict(Shared::new(dict))
+    /// Build a dict from a flat `[k, v, k, v, ...]` mark, dropping any entry
+    /// whose key is not hashable (matching the old converter).
+    fn dict_from_items(items: Vec<V>) -> V {
+        V::Dict(Shared::new(Dict::from_iter(Self::pairs_from_flat(items))))
     }
 
-    /// Parse a value from the underlying stream.  This will consume the whole
-    /// pickle until the STOP opcode.
-    fn parse_value(&mut self) -> Result<Value> {
+    /// Turn a flat `[k, v, k, v, ...]` vec into hashable (key, value) pairs,
+    /// skipping entries whose key is not hashable.
+    fn pairs_from_flat(items: Vec<V>) -> Vec<(HashableValue, V)> {
+        let mut pairs = Vec::with_capacity(items.len() / 2);
+        let mut it = items.into_iter();
+        while let Some(k) = it.next() {
+            let Some(v) = it.next() else { break };
+            if let Ok(hk) = k.into_hashable() {
+                pairs.push((hk, v));
+            }
+        }
+        pairs
+    }
+
+    /// Parse a value from the underlying stream.  This consumes the whole
+    /// pickle until the STOP opcode, building the public `value::Value` directly.
+    fn parse_value(&mut self) -> Result<V> {
         loop {
             let value = self.read_byte()?;
             let opcode = Opcode::try_from(value).map_err(|code| self.inner_error(code))?;
@@ -471,15 +471,15 @@ impl<R: Read> Deserializer<R> {
             match opcode {
                 // Specials
                 Opcode::Proto => {
-                    // Ignore this, as it is only important for instances (read
-                    // the version byte).
                     self.read_byte()?;
                 }
                 Opcode::Frame => {
-                    // We'll ignore framing. But we still have to gobble up the length.
                     self.read_fixed_8_bytes()?;
                 }
-                Opcode::Stop => return self.pop(),
+                Opcode::Stop => {
+                    let item = self.pop()?;
+                    return Ok(self.demote(item));
+                }
                 Opcode::Mark => {
                     let stack = mem::replace(&mut self.stack, Vec::with_capacity(128));
                     self.stacks.push(stack);
@@ -495,8 +495,11 @@ impl<R: Read> Deserializer<R> {
                     self.pop_mark()?;
                 }
                 Opcode::Dup => {
-                    let top = self.top()?.clone();
-                    self.stack.push(top);
+                    let top = self.stack.last().cloned();
+                    match top {
+                        Some(item) => self.stack.push(item),
+                        None => return self.error(ErrorCode::StackUnderflow),
+                    }
                 }
 
                 // Memo saving ops
@@ -523,38 +526,38 @@ impl<R: Read> Deserializer<R> {
                 Opcode::Get => {
                     let bytes = self.read_line()?;
                     let memo_id = self.parse_ascii(bytes)?;
-                    self.push_memo_ref(memo_id)?;
+                    self.get_memo(memo_id)?;
                 }
                 Opcode::BinGet => {
                     let memo_id = self.read_byte()?;
-                    self.push_memo_ref(memo_id.into())?;
+                    self.get_memo(memo_id.into())?;
                 }
                 Opcode::LongBinGet => {
                     let bytes = self.read_fixed_4_bytes()?;
                     let memo_id = LittleEndian::read_u32(&bytes);
-                    self.push_memo_ref(memo_id)?;
+                    self.get_memo(memo_id)?;
                 }
 
                 // Singletons
-                Opcode::None => self.stack.push(Value::None),
-                Opcode::NewFalse => self.stack.push(Value::Bool(false)),
-                Opcode::NewTrue => self.stack.push(Value::Bool(true)),
+                Opcode::None => self.push_val(V::None),
+                Opcode::NewFalse => self.push_val(V::Bool(false)),
+                Opcode::NewTrue => self.push_val(V::Bool(true)),
 
                 // ASCII-formatted numbers
                 Opcode::Int => {
                     let line = self.read_line()?;
                     let val = self.decode_text_int(line)?;
-                    self.stack.push(val);
+                    self.push_val(val);
                 }
                 Opcode::Long => {
                     let line = self.read_line()?;
                     let long = self.decode_text_long(line)?;
-                    self.stack.push(long);
+                    self.push_val(long);
                 }
                 Opcode::Float => {
                     let line = self.read_line()?;
                     let f = self.parse_ascii(line)?;
-                    self.stack.push(Value::F64(f));
+                    self.push_val(V::F64(f));
                 }
 
                 // ASCII-formatted strings
@@ -565,10 +568,9 @@ impl<R: Read> Deserializer<R> {
                     } else {
                         let string = self.decode_escaped_string(&line)?;
                         self.strings_rc.insert(line, string.clone());
-
                         string
                     };
-                    self.stack.push(string);
+                    self.push_val(string);
                 }
                 Opcode::Unicode => {
                     let line = self.read_line()?;
@@ -577,89 +579,86 @@ impl<R: Read> Deserializer<R> {
                     } else {
                         let string = self.decode_escaped_unicode(&line)?;
                         self.strings_rc.insert(line, string.clone());
-
                         string
                     };
-                    self.stack.push(string);
+                    self.push_val(string);
                 }
 
                 // Binary-coded numbers
                 Opcode::BinFloat => {
                     let bytes = self.read_fixed_8_bytes()?;
-                    self.stack.push(Value::F64(BigEndian::read_f64(&bytes)));
+                    self.push_val(V::F64(BigEndian::read_f64(&bytes)));
                 }
                 Opcode::BinInt => {
                     let bytes = self.read_fixed_4_bytes()?;
-                    self.stack
-                        .push(Value::I64(LittleEndian::read_i32(&bytes).into()));
+                    self.push_val(V::I64(LittleEndian::read_i32(&bytes).into()));
                 }
                 Opcode::BinInt1 => {
                     let byte = self.read_byte()?;
-                    self.stack.push(Value::I64(byte.into()));
+                    self.push_val(V::I64(byte.into()));
                 }
                 Opcode::BinInt2 => {
                     let bytes = self.read_fixed_2_bytes()?;
-                    self.stack
-                        .push(Value::I64(LittleEndian::read_u16(&bytes).into()));
+                    self.push_val(V::I64(LittleEndian::read_u16(&bytes).into()));
                 }
                 Opcode::Long1 => {
                     let bytes = self.read_u8_prefixed_bytes()?;
                     let long = self.decode_binary_long(bytes);
-                    self.stack.push(long);
+                    self.push_val(long);
                 }
                 Opcode::Long4 => {
                     let bytes = self.read_i32_prefixed_bytes()?;
                     let long = self.decode_binary_long(bytes);
-                    self.stack.push(long);
+                    self.push_val(long);
                 }
 
                 // Length-prefixed (byte)strings
                 Opcode::ShortBinBytes => {
                     let string = self.read_u8_prefixed_bytes()?;
-                    self.stack.push(Value::Bytes(SharedFrozen::new(string)));
+                    self.push_val(V::Bytes(SharedFrozen::new(string)));
                 }
                 Opcode::BinBytes => {
                     let string = self.read_u32_prefixed_bytes()?;
-                    self.stack.push(Value::Bytes(SharedFrozen::new(string)));
+                    self.push_val(V::Bytes(SharedFrozen::new(string)));
                 }
                 Opcode::BinBytes8 => {
                     let string = self.read_u64_prefixed_bytes()?;
-                    self.stack.push(Value::Bytes(SharedFrozen::new(string)));
+                    self.push_val(V::Bytes(SharedFrozen::new(string)));
                 }
                 Opcode::ShortBinString => {
                     let string = self.read_u8_prefixed_bytes()?;
                     let decoded = self.decode_string(string)?;
-                    self.stack.push(decoded);
+                    self.push_val(decoded);
                 }
                 Opcode::BinString => {
                     let string = self.read_i32_prefixed_bytes()?;
                     let decoded = self.decode_string(string)?;
-                    self.stack.push(decoded);
+                    self.push_val(decoded);
                 }
                 Opcode::ShortBinUnicode => {
                     let string = self.read_u8_prefixed_bytes()?;
                     let decoded = self.decode_unicode(string)?;
-                    self.stack.push(decoded);
+                    self.push_val(decoded);
                 }
                 Opcode::BinUnicode => {
                     let string = self.read_u32_prefixed_bytes()?;
                     let decoded = self.decode_unicode(string)?;
-                    self.stack.push(decoded);
+                    self.push_val(decoded);
                 }
                 Opcode::BinUnicode8 => {
                     let string = self.read_u64_prefixed_bytes()?;
                     let decoded = self.decode_unicode(string)?;
-                    self.stack.push(decoded);
+                    self.push_val(decoded);
                 }
                 Opcode::ByteArray8 => {
                     let string = self.read_u64_prefixed_bytes()?;
-                    self.stack.push(Value::Bytes(SharedFrozen::new(string)));
+                    self.push_val(V::Bytes(SharedFrozen::new(string)));
                 }
 
                 // Tuples
                 Opcode::EmptyTuple => {
                     let tuple = self.tuple_from_items(Vec::new());
-                    self.stack.push(tuple)
+                    self.stack.push(tuple);
                 }
                 Opcode::Tuple1 => {
                     let item = self.pop()?;
@@ -686,49 +685,58 @@ impl<R: Read> Deserializer<R> {
                 }
 
                 // Lists
-                Opcode::EmptyList => self.stack.push(Value::List(Shared::new(Vec::new()))),
+                Opcode::EmptyList => self.push_val(V::List(Shared::new(Vec::new()))),
                 Opcode::List => {
-                    let items = self.pop_mark()?;
-                    let list = self.list_from_items(items);
-                    self.stack.push(list);
+                    let items = self.pop_mark_values()?;
+                    self.push_val(Self::list_from_items(items));
                 }
                 Opcode::Append => {
-                    let value = self.pop()?;
+                    let item = self.pop()?;
+                    let value = self.demote(item);
                     self.modify_list(|list| list.push(value))?;
                 }
                 Opcode::Appends => {
-                    let items = self.pop_mark()?;
+                    let items = self.pop_mark_values()?;
                     self.modify_list(|list| list.extend(items))?;
                 }
 
                 // Dicts
-                Opcode::EmptyDict => self.stack.push(Value::Dict(Shared::new(Vec::new()))),
+                Opcode::EmptyDict => self.push_val(V::Dict(Shared::new(Dict::new()))),
                 Opcode::Dict => {
-                    let items = self.pop_mark()?;
-
-                    let dict = self.dict_from_items(items);
-
-                    self.stack.push(dict);
+                    let items = self.pop_mark_values()?;
+                    self.push_val(Self::dict_from_items(items));
                 }
                 Opcode::SetItem => {
-                    let value = self.pop()?;
-                    let key = self.pop()?;
-                    self.modify_dict(|dict| dict.push((key, value)))?;
+                    let value_item = self.pop()?;
+                    let value = self.demote(value_item);
+                    let key_item = self.pop()?;
+                    let key = self.demote(key_item);
+                    let pairs = Self::pairs_from_flat(vec![key, value]);
+                    self.modify_dict(pairs)?;
                 }
                 Opcode::SetItems => {
-                    let items = self.pop_mark()?;
-                    self.modify_dict(|dict| Self::extend_dict(dict, items))?;
+                    let items = self.pop_mark_values()?;
+                    let pairs = Self::pairs_from_flat(items);
+                    self.modify_dict(pairs)?;
                 }
 
                 // Sets and frozensets
-                Opcode::EmptySet => self.stack.push(Value::Set(Shared::new(Vec::new()))),
+                Opcode::EmptySet => self.push_val(V::Set(Shared::new(BTreeSet::new()))),
                 Opcode::FrozenSet => {
-                    let items = self.pop_mark()?;
-                    self.stack.push(Value::FrozenSet(SharedFrozen::new(items)));
+                    let items = self.pop_mark_values()?;
+                    let set: BTreeSet<HashableValue> = items
+                        .into_iter()
+                        .filter_map(|v| v.into_hashable().ok())
+                        .collect();
+                    self.push_val(V::FrozenSet(SharedFrozen::new(set)));
                 }
                 Opcode::AddItems => {
-                    let items = self.pop_mark()?;
-                    self.modify_set(|set| set.extend(items))?;
+                    let items = self.pop_mark_values()?;
+                    let hashables: Vec<HashableValue> = items
+                        .into_iter()
+                        .filter_map(|v| v.into_hashable().ok())
+                        .collect();
+                    self.modify_set(hashables)?;
                 }
 
                 // Arbitrary module globals, used here for unpickling set and frozenset
@@ -736,27 +744,32 @@ impl<R: Read> Deserializer<R> {
                 Opcode::Global => {
                     let modname = self.read_line()?;
                     let globname = self.read_line()?;
-                    let value = self.decode_global(modname, globname)?;
-                    self.stack.push(value);
+                    let item = self.decode_global(modname, globname)?;
+                    self.stack.push(item);
                 }
                 Opcode::StackGlobal => {
-                    let globname = match self.pop_resolve()? {
-                        Value::String(string) => string.into_raw_or_cloned().into_bytes(),
+                    let globname = match self.pop()? {
+                        Item::Value(V::String(string)) => string.into_raw_or_cloned().into_bytes(),
                         other => return Self::stack_error("string", &other, self.pos),
                     };
-                    let modname = match self.pop_resolve()? {
-                        Value::String(string) => string.into_raw_or_cloned().into_bytes(),
+                    let modname = match self.pop()? {
+                        Item::Value(V::String(string)) => string.into_raw_or_cloned().into_bytes(),
                         other => return Self::stack_error("string", &other, self.pos),
                     };
-                    let value = self.decode_global(modname, globname)?;
-                    self.stack.push(value);
+                    let item = self.decode_global(modname, globname)?;
+                    self.stack.push(item);
                 }
                 Opcode::Reduce => {
-                    let argtuple = match self.pop_resolve()? {
-                        Value::Tuple(args) => args,
+                    let argtuple: Vec<Item> = match self.pop()? {
+                        Item::Args(items) => items,
+                        Item::Value(V::Tuple(args)) => args
+                            .into_raw_or_cloned()
+                            .into_iter()
+                            .map(Item::Value)
+                            .collect(),
                         other => return Self::stack_error("tuple", &other, self.pos),
                     };
-                    let global = self.pop_resolve()?;
+                    let global = self.pop()?;
                     self.reduce_global(global, argtuple)?;
                 }
 
@@ -779,29 +792,18 @@ impl<R: Read> Deserializer<R> {
                     } else {
                         args.remove(0)
                     };
-                    let cls = self.resolve(Some(cls));
                     let (modname, globname) = match &cls {
-                        Some(Value::Global(Global::Other(names))) => {
-                            (names.0.as_ref(), names.1.as_ref())
-                        }
-                        _ => {
-                            return Self::stack_error(
-                                "global reference",
-                                cls.as_ref().unwrap_or(&Value::None),
-                                self.pos,
-                            );
-                        }
+                        Item::Global(Global::Other(names)) => (names.0.as_ref(), names.1.as_ref()),
+                        _ => return Self::stack_error("global reference", &cls, self.pos),
                     };
                     let obj = self.make_object(modname, globname);
                     self.stack.push(obj);
                 }
                 Opcode::NewObj => {
                     let _args = self.pop()?;
-                    let cls = self.pop_resolve()?;
+                    let cls = self.pop()?;
                     let (modname, globname) = match &cls {
-                        Value::Global(Global::Other(names)) => {
-                            (names.0.as_ref(), names.1.as_ref())
-                        }
+                        Item::Global(Global::Other(names)) => (names.0.as_ref(), names.1.as_ref()),
                         _ => return Self::stack_error("global reference", &cls, self.pos),
                     };
                     let obj = self.make_object(modname, globname);
@@ -810,51 +812,26 @@ impl<R: Read> Deserializer<R> {
                 Opcode::NewObjEx => {
                     let _kwargs = self.pop()?;
                     let _args = self.pop()?;
-                    let cls = self.pop_resolve()?;
+                    let cls = self.pop()?;
                     let (modname, globname) = match &cls {
-                        Value::Global(Global::Other(names)) => {
-                            (names.0.as_ref(), names.1.as_ref())
-                        }
+                        Item::Global(Global::Other(names)) => (names.0.as_ref(), names.1.as_ref()),
                         _ => return Self::stack_error("global reference", &cls, self.pos),
                     };
                     let obj = self.make_object(modname, globname);
                     self.stack.push(obj);
                 }
                 Opcode::Build => {
-                    let state = self.pop()?;
+                    let state = self.pop()?.into_value_lossy();
                     let obj = self.pop()?;
-
-                    let _standin = self.resolve(Some(obj.clone()));
-
-                    // Resolve state if it's a MemoRef
-                    let resolved_state = self.resolve(Some(state.clone())).unwrap_or(state.clone());
-
                     match obj {
-                        Value::MemoRef(id) => {
-                            // Check if the memo'd value is an Object
-                            let is_object =
-                                matches!(self.memo_get(id), Some((Value::Object(_), _)));
-                            if is_object {
-                                // Convert state before mutably borrowing memo
-                                let public_state = self.de_value_to_public_value(resolved_state);
-                                if let Some((Value::Object(o), _)) = self.memo_get_mut(id) {
-                                    o.__setstate__(public_state);
-                                }
-                                let updated = self.memo_get(id).unwrap().0.clone();
-                                self.stack.push(updated);
-                            } else {
-                                self.memoize(id, state.clone())?;
-                                self.stack.push(state);
-                            }
+                        Item::Value(V::Object(shared)) => {
+                            // GET handed out an Rc clone, so mutating through the
+                            // shared cell also updates the memoized instance.
+                            shared.inner_mut().__setstate__(state);
+                            self.push_val(V::Object(shared));
                         }
-                        Value::Object(mut o) => {
-                            o.__setstate__(self.de_value_to_public_value(resolved_state));
-                            self.stack.push(Value::Object(o));
-                        }
-                        _ => {
-                            // Legacy behavior: replace standin with state
-                            self.stack.push(state);
-                        }
+                        // Legacy: a non-object standin is replaced by the state.
+                        _ => self.push_val(state),
                     }
                 }
             }
@@ -862,128 +839,106 @@ impl<R: Read> Deserializer<R> {
     }
 
     // Pop the stack top item.
-    fn pop(&mut self) -> Result<Value> {
+    fn pop(&mut self) -> Result<Item> {
         match self.stack.pop() {
             Some(v) => Ok(v),
             None => self.error(ErrorCode::StackUnderflow),
         }
     }
 
-    // Pop the stack top item, and resolve it if it is a memo reference.
-    fn pop_resolve(&mut self) -> Result<Value> {
-        let top = self.stack.pop();
-        match self.resolve(top) {
-            Some(v) => Ok(v),
-            None => self.error(ErrorCode::StackUnderflow),
-        }
-    }
-
     // Pop all topmost stack items until the next MARK.
-    fn pop_mark(&mut self) -> Result<Vec<Value>> {
+    fn pop_mark(&mut self) -> Result<Vec<Item>> {
         match self.stacks.pop() {
             Some(new) => Ok(mem::replace(&mut self.stack, new)),
             None => self.error(ErrorCode::StackUnderflow),
         }
     }
 
-    // Mutably view the stack top item.
-    fn top(&mut self) -> Result<&mut Value> {
-        match self.stack.last_mut() {
-            // Since some operations like APPEND do things to the stack top, we
-            // need to provide the reference to the "real" object here, not the
-            // MemoRef variant.
-            Some(&mut Value::MemoRef(n)) => self
-                .memo
-                .get_mut(n as usize)
-                .and_then(Option::as_mut)
-                .map(|&mut (ref mut v, _)| v)
-                .ok_or(Error::Syntax(ErrorCode::MissingMemo(n))),
-            Some(other_value) => Ok(other_value),
-            None => Err(Error::Eval(ErrorCode::StackUnderflow, self.pos)),
-        }
+    // Pop a MARK group as public values (a bare global becomes `None`).
+    fn pop_mark_values(&mut self) -> Result<Vec<V>> {
+        let items = self.pop_mark()?;
+        Ok(items.into_iter().map(|it| self.demote(it)).collect())
     }
 
-    // Pushes a memo reference on the stack, and increases the usage counter.
-    fn push_memo_ref(&mut self, memo_id: MemoId) -> Result<()> {
-        self.stack.push(Value::MemoRef(memo_id));
-        match self.memo_get_mut(memo_id) {
-            Some(&mut (_, ref mut count)) => {
-                if MEMO_REF_COUNTING {
-                    *count += 1;
-                }
+    // Push a clone of a memoized item. For containers this is an `Rc` clone, so
+    // the pushed value shares identity with the memoized one and later in-place
+    // mutation (APPEND/SETITEM/BUILD) updates both.
+    fn get_memo(&mut self, memo_id: MemoId) -> Result<()> {
+        match self.memo_get(memo_id) {
+            Some((item, _)) => {
+                let item = item.clone();
+                self.stack.push(item);
                 Ok(())
             }
             None => Err(Error::Eval(ErrorCode::MissingMemo(memo_id), self.pos)),
         }
     }
 
-    // Memoize the current stack top with the given ID.  Moves the actual
-    // object into the memo, and saves a reference on the stack instead.
+    // Memoize the current stack top under the given id, leaving it on the stack
+    // (a cheap `Rc` clone is stored, sharing identity with the stack value).
     fn memoize_next(&mut self, memo_id: MemoId) -> Result<()> {
         let item = self.pop()?;
-        self.memoize(memo_id, item)?;
-        self.stack.push(Value::MemoRef(memo_id));
+        self.memo_insert(memo_id, (item.clone(), 1));
+        self.stack.push(item);
         Ok(())
     }
 
-    fn memoize(&mut self, memo_id: MemoId, mut item: Value) -> Result<()> {
-        if let Value::MemoRef(id) = item {
-            // TODO: is this even possible?
-            item = match self.memo_get(id) {
-                Some((v, _)) => v.clone(),
-                None => return Err(Error::Eval(ErrorCode::MissingMemo(id), self.pos)),
-            };
-        }
-        self.memo_insert(memo_id, (item, 1));
-        Ok(())
-    }
-
-    // Resolve memo reference during stream decoding.
-    fn resolve(&mut self, maybe_memo: Option<Value>) -> Option<Value> {
-        match maybe_memo {
-            Some(Value::MemoRef(id)) => {
-                self.memo_get_mut(id).map(|&mut (ref val, ref mut count)| {
-                    if MEMO_REF_COUNTING {
-                        // We can't remove it from the memo here, since we haven't
-                        // decoded the whole stream yet and there may be further
-                        // references to the value.
-                        *count -= 1;
-                    }
-                    val.clone()
-                })
+    // APPEND/APPENDS: mutate the stack-top list in place.
+    fn modify_list(&mut self, f: impl FnOnce(&mut Vec<V>)) -> Result<()> {
+        match self.stack.last() {
+            Some(Item::Value(V::List(list))) => {
+                f(&mut list.inner_mut());
+                Ok(())
             }
-            other => other,
+            other => {
+                let pos = self.pos;
+                match other {
+                    Some(item) => Self::stack_error("list", &item.clone(), pos),
+                    None => self.error(ErrorCode::StackUnderflow),
+                }
+            }
         }
     }
 
-    // Resolve memo reference during Value deserializing.
-    fn resolve_recursive<T, U, F>(&mut self, id: MemoId, u: U, f: F) -> Result<T>
-    where
-        F: FnOnce(&mut Self, U, Value) -> Result<T>,
-    {
-        // Take the value from the memo while visiting it.  This prevents us
-        // from trying to depickle recursive structures, which we can't do
-        // because our Values aren't references.
-        let (value, mut count) = match self.memo_remove(id) {
-            Some(entry) => entry,
-            None => {
-                return if self.options.replace_recursive_structures {
-                    f(self, u, Value::None)
-                } else {
-                    Err(Error::Syntax(ErrorCode::Recursive))
-                };
+    // SETITEM/SETITEMS: insert sorted (key, value) pairs into the stack-top dict,
+    // or dispatch to an object's `__setitem__`.
+    fn modify_dict(&mut self, pairs: Vec<(HashableValue, V)>) -> Result<()> {
+        match self.stack.last() {
+            Some(Item::Value(V::Dict(dict))) => {
+                dict.inner_mut().extend_sorted(pairs);
+                Ok(())
             }
-        };
-        if MEMO_REF_COUNTING {
-            count -= 1;
+            Some(Item::Value(V::Object(obj))) => {
+                let mut o = obj.inner_mut();
+                for (k, v) in pairs {
+                    o.__setitem__(k.into_value(), v);
+                }
+                Ok(())
+            }
+            other => {
+                let pos = self.pos;
+                match other {
+                    Some(item) => Self::stack_error("dict", &item.clone(), pos),
+                    None => self.error(ErrorCode::StackUnderflow),
+                }
+            }
         }
-        if count <= 0 && MEMO_REF_COUNTING {
-            f(self, u, value)
-            // No need to put it back.
-        } else {
-            let result = f(self, u, value.clone());
-            assert!(self.memo_insert(id, (value, count)).is_none());
-            result
+    }
+
+    // ADDITEMS: insert into the stack-top set.
+    fn modify_set(&mut self, items: Vec<HashableValue>) -> Result<()> {
+        match self.stack.last() {
+            Some(Item::Value(V::Set(set))) => {
+                set.inner_mut().extend(items);
+                Ok(())
+            }
+            other => {
+                let pos = self.pos;
+                match other {
+                    Some(item) => Self::stack_error("set", &item.clone(), pos),
+                    None => self.error(ErrorCode::StackUnderflow),
+                }
+            }
         }
     }
 
@@ -1125,33 +1080,33 @@ impl<R: Read> Deserializer<R> {
     }
 
     // Decode a text-encoded integer.
-    fn decode_text_int(&self, line: Vec<u8>) -> Result<Value> {
+    fn decode_text_int(&self, line: Vec<u8>) -> Result<V> {
         // Handle protocol 1 way of spelling true/false
         Ok(if line == b"00" {
-            Value::Bool(false)
+            V::Bool(false)
         } else if line == b"01" {
-            Value::Bool(true)
+            V::Bool(true)
         } else {
             let i = self.parse_ascii(line)?;
-            Value::I64(i)
+            V::I64(i)
         })
     }
 
     // Decode a text-encoded long integer.
-    fn decode_text_long(&self, mut line: Vec<u8>) -> Result<Value> {
+    fn decode_text_long(&self, mut line: Vec<u8>) -> Result<V> {
         // Remove "L" suffix.
         if line.last() == Some(&b'L') {
             line.pop();
         }
         match BigInt::parse_bytes(&line, 10) {
-            Some(i) => Ok(Value::Int(Box::new(i))),
+            Some(i) => Ok(Self::normalize_int(i)),
             None => self.error(ErrorCode::InvalidLiteral(line)),
         }
     }
 
     // Decode an escaped string.  These are encoded with "normal" Python string
     // escape rules.
-    fn decode_escaped_string(&self, slice: &[u8]) -> Result<Value> {
+    fn decode_escaped_string(&self, slice: &[u8]) -> Result<V> {
         // Remove quotes if they appear.
         let slice = if (slice.len() >= 2)
             && (slice[0] == slice[slice.len() - 1])
@@ -1198,7 +1153,7 @@ impl<R: Read> Deserializer<R> {
     // Decode escaped Unicode strings. These are encoded with "raw-unicode-escape",
     // which only knows the \uXXXX and \UYYYYYYYY escapes. The backslash is escaped
     // in this way, too.
-    fn decode_escaped_unicode(&self, s: &[u8]) -> Result<Value> {
+    fn decode_escaped_unicode(&self, s: &[u8]) -> Result<V> {
         let mut result = String::with_capacity(s.len());
         let mut iter = s.iter();
         while let Some(&b) = iter.next() {
@@ -1225,17 +1180,17 @@ impl<R: Read> Deserializer<R> {
                 _ => result.push(b as char),
             }
         }
-        Ok(Value::String(SharedFrozen::new(result)))
+        Ok(V::String(SharedFrozen::new(result)))
     }
 
     // Decode a byte string by trying each enabled decoder in order:
     // UTF-8 -> custom encodings -> latin-1 -> Bytes
-    fn decode_string(&self, string: Vec<u8>) -> Result<Value> {
+    fn decode_string(&self, string: Vec<u8>) -> Result<V> {
         let mut bytes = string;
 
         if self.options.decode_utf8 {
             match String::from_utf8(bytes) {
-                Ok(v) => return Ok(Value::String(SharedFrozen::new(v))),
+                Ok(v) => return Ok(V::String(SharedFrozen::new(v))),
                 Err(e) => bytes = e.into_bytes(),
             }
         }
@@ -1244,7 +1199,7 @@ impl<R: Read> Deserializer<R> {
         for encoding in &self.options.fallback_encodings {
             let (decoded, _, had_errors) = encoding.decode(&bytes);
             if !had_errors {
-                return Ok(Value::String(SharedFrozen::new(decoded.into_owned())));
+                return Ok(V::String(SharedFrozen::new(decoded.into_owned())));
             }
         }
 
@@ -1252,10 +1207,10 @@ impl<R: Read> Deserializer<R> {
         // to utf-8, so if that's enabled, try that as a last resort
         if self.options.decode_latin1 {
             let decoded: String = bytes.iter().map(|&b| b as char).collect();
-            return Ok(Value::String(SharedFrozen::new(decoded)));
+            return Ok(V::String(SharedFrozen::new(decoded)));
         }
 
-        Ok(Value::Bytes(SharedFrozen::new(bytes)))
+        Ok(V::Bytes(SharedFrozen::new(bytes)))
     }
 
     // Decode a Unicode string from UTF-8.
@@ -1264,15 +1219,15 @@ impl<R: Read> Deserializer<R> {
     // falling back: the calling opcodes (BINUNICODE, SHORT_BINUNICODE,
     // UNICODE) are defined to carry Python str data, so bad bytes here
     // mean a broken pickle, not an unknown encoding.
-    fn decode_unicode(&self, string: Vec<u8>) -> Result<Value> {
+    fn decode_unicode(&self, string: Vec<u8>) -> Result<V> {
         match String::from_utf8(string) {
-            Ok(v) => Ok(Value::String(SharedFrozen::new(v))),
+            Ok(v) => Ok(V::String(SharedFrozen::new(v))),
             Err(_) => self.error(ErrorCode::StringNotUTF8),
         }
     }
 
     // Decode a binary-encoded long integer.
-    fn decode_binary_long(&self, bytes: Vec<u8>) -> Value {
+    fn decode_binary_long(&self, bytes: Vec<u8>) -> V {
         // BigInt::from_bytes_le doesn't like a sign bit in the bytes, therefore
         // we have to extract that ourselves and do the two-s complement.
         let negative = !bytes.is_empty() && (bytes[bytes.len() - 1] & 0x80 != 0);
@@ -1280,284 +1235,98 @@ impl<R: Read> Deserializer<R> {
         if negative {
             val -= BigInt::from(1) << (bytes.len() * 8);
         }
-        Value::Int(Box::new(val))
+        Self::normalize_int(val)
+    }
+
+    // Long opcodes carry arbitrary-precision ints; normalize to I64 when they
+    // fit, matching how short integer opcodes (and the old converter) behaved.
+    fn normalize_int(i: BigInt) -> V {
+        match i.to_i64() {
+            Some(n) => V::I64(n),
+            None => V::Int(Box::new(i)),
+        }
     }
 
     /// Create an object using the factory callback, or fall back to DictObject.
-    fn make_object(&self, modname: &str, globname: &str) -> Value {
+    fn make_object(&self, modname: &str, globname: &str) -> Item {
         let info = crate::object::ObjectConstructionInfo {
             module: modname,
             class: globname,
         };
-        // Try user factory first
         if let Some(ref factory) = self.options.object_factory
             && let Some(obj) = factory(info)
         {
-            return Value::Object(obj);
+            return Item::Value(V::Object(Shared::new(obj)));
         }
-        // Fall back to DictObject
-        Value::Object(Box::new(DictObject::new(
+        Item::Value(V::Object(Shared::new(Box::new(DictObject::new(
             modname.to_owned(),
             globname.to_owned(),
-        )))
+        )))))
     }
 
-    /// Convert internal de::Value to public value::Value for passing to PickleObject methods.
-    /// Resolves MemoRefs using the deserializer's memo table.
-    fn de_value_to_public_value(&mut self, v: Value) -> value::Value {
-        // Resolve MemoRef first
-        let v = match v {
-            Value::MemoRef(id) => match self.memo_get(id) {
-                Some((val, _)) => val.clone(),
-                None => return value::Value::None,
-            },
-            other => other,
-        };
-        match v {
-            Value::None => value::Value::None,
-            Value::Bool(b) => value::Value::Bool(b),
-            Value::I64(i) => value::Value::I64(i),
-            Value::Int(i) => {
-                if let Some(i) = i.to_i64() {
-                    value::Value::I64(i)
-                } else {
-                    value::Value::Int(i)
-                }
-            }
-            Value::F64(f) => value::Value::F64(f),
-            Value::Bytes(b) => value::Value::Bytes(b),
-            Value::String(s) => value::Value::String(s),
-            Value::Tuple(t) => {
-                let id = t.stable_id();
-                if let Some(v) = self.converted_rc.get(&id) {
-                    return v.clone();
-                }
-                let converted = t
-                    .inner()
-                    .iter()
-                    .cloned()
-                    .map(|v| self.de_value_to_public_value(v))
-                    .collect();
-                let val = value::Value::Tuple(SharedFrozen::new(converted));
-                self.converted_rc.insert(id, val.clone());
-                val
-            }
-            Value::List(l) => {
-                let id = l.stable_id();
-                if let Some(v) = self.converted_rc.get(&id) {
-                    return v.clone();
-                }
-                let converted = l
-                    .inner()
-                    .iter()
-                    .cloned()
-                    .map(|v| self.de_value_to_public_value(v))
-                    .collect();
-                let val = value::Value::List(Shared::new(converted));
-                self.converted_rc.insert(id, val.clone());
-                val
-            }
-            Value::Dict(d) => {
-                let id = d.stable_id();
-                if let Some(v) = self.converted_rc.get(&id) {
-                    return v.clone();
-                }
-                let dict = d
-                    .inner()
-                    .iter()
-                    .filter_map(|(k, v)| {
-                        let hk = self.de_value_to_public_value(k.clone()).into_hashable().ok()?;
-                        Some((hk, self.de_value_to_public_value(v.clone())))
-                    })
-                    .collect::<value::Dict>();
-                let val = value::Value::Dict(Shared::new(dict));
-                self.converted_rc.insert(id, val.clone());
-                val
-            }
-            Value::Set(s) => {
-                let id = s.stable_id();
-                if let Some(v) = self.converted_rc.get(&id) {
-                    return v.clone();
-                }
-                let converted = s
-                    .inner()
-                    .iter()
-                    .cloned()
-                    .filter_map(|v| self.de_value_to_public_value(v).into_hashable().ok())
-                    .collect();
-                let val = value::Value::Set(Shared::new(converted));
-                self.converted_rc.insert(id, val.clone());
-                val
-            }
-            Value::FrozenSet(s) => {
-                let id = s.stable_id();
-                if let Some(v) = self.converted_rc.get(&id) {
-                    return v.clone();
-                }
-                let converted = s
-                    .inner()
-                    .iter()
-                    .cloned()
-                    .filter_map(|v| self.de_value_to_public_value(v).into_hashable().ok())
-                    .collect();
-                let val = value::Value::FrozenSet(SharedFrozen::new(converted));
-                self.converted_rc.insert(id, val.clone());
-                val
-            }
-            Value::Object(o) => value::Value::Object(Shared::new(o)),
-            Value::MemoRef(_) => unreachable!("already resolved above"),
-            Value::Global(_) => value::Value::None,
-        }
-    }
-
-    // Modify the stack-top list.
-    fn modify_list<F>(&mut self, f: F) -> Result<()>
-    where
-        F: FnOnce(&mut Vec<Value>),
-    {
-        let pos = self.pos;
-        let top = self.top()?;
-
-        match *top {
-            Value::List(ref list) => {
-                let mut list = list.inner_mut();
-                f(&mut list);
-                return Ok(());
-            }
-            _ => {
-                // Fallthrough to error
-            }
-        }
-
-        Self::stack_error("list", top, pos)
-    }
-
-    // Push items from a (key, value, key, value) flattened list onto a (key, value) vec.
-    fn extend_dict(dict: &mut Vec<(Value, Value)>, items: Vec<Value>) {
-        let mut key = None;
-        for value in items {
-            match key.take() {
-                None => key = Some(value),
-                Some(key) => dict.push((key, value)),
-            }
-        }
-    }
-
-    // Modify the stack-top dict, or call __setitem__ on an Object.
-    fn modify_dict<F>(&mut self, f: F) -> Result<()>
-    where
-        F: FnOnce(&mut Vec<(Value, Value)>),
-    {
-        let pos = self.pos;
-        let top = self.top()?;
-        match *top {
-            Value::Dict(ref dict) => {
-                let mut dict = dict.inner_mut();
-                f(&mut dict);
-                return Ok(());
-            }
-            Value::Object(_) => {
-                // Collect items via the closure, then convert and dispatch to __setitem__
-                let mut items = Vec::new();
-                f(&mut items);
-                let converted: Vec<_> = items
-                    .into_iter()
-                    .map(|(k, v)| {
-                        (
-                            self.de_value_to_public_value(k),
-                            self.de_value_to_public_value(v),
-                        )
-                    })
-                    .collect();
-                // Re-borrow top to get the Object
-                let top = self.top()?;
-                if let Value::Object(ref mut obj) = *top {
-                    for (key, value) in converted {
-                        obj.__setitem__(key, value);
-                    }
-                }
-                return Ok(());
-            }
-            _ => {
-                // Fallthrough to error
-            }
-        }
-
-        Self::stack_error("dict", top, pos)
-    }
-
-    // Modify the stack-top set.
-    fn modify_set<F>(&mut self, f: F) -> Result<()>
-    where
-        F: FnOnce(&mut Vec<Value>),
-    {
-        let pos = self.pos;
-        let top = self.top()?;
-        if let Value::Set(ref set) = *top {
-            let mut set = set.inner_mut();
-            f(&mut set);
-            Ok(())
-        } else {
-            Self::stack_error("set", top, pos)
-        }
-    }
-
-    // Push the Value::Global referenced by modname and globname.
-    fn decode_global(&mut self, modname: Vec<u8>, globname: Vec<u8>) -> Result<Value> {
+    // Push the global referenced by modname and globname.
+    fn decode_global(&mut self, modname: Vec<u8>, globname: Vec<u8>) -> Result<Item> {
         let value = match (&*modname, &*globname) {
-            (b"_codecs", b"encode") => Value::Global(Global::Encode),
-            (b"__builtin__", b"set") | (b"builtins", b"set") => Value::Global(Global::Set),
+            (b"_codecs", b"encode") => Item::Global(Global::Encode),
+            (b"__builtin__", b"set") | (b"builtins", b"set") => Item::Global(Global::Set),
             (b"__builtin__", b"frozenset") | (b"builtins", b"frozenset") => {
-                Value::Global(Global::Frozenset)
+                Item::Global(Global::Frozenset)
             }
-            (b"__builtin__", b"list") | (b"builtins", b"list") => Value::Global(Global::List),
+            (b"__builtin__", b"list") | (b"builtins", b"list") => Item::Global(Global::List),
             (b"__builtin__", b"bytearray") | (b"builtins", b"bytearray") => {
-                Value::Global(Global::Bytearray)
+                Item::Global(Global::Bytearray)
             }
-            (b"__builtin__", b"int") | (b"builtins", b"int") => Value::Global(Global::Int),
-            (b"copy_reg", b"_reconstructor") => Value::Global(Global::Reconstructor),
+            (b"__builtin__", b"int") | (b"builtins", b"int") => Item::Global(Global::Int),
+            (b"copy_reg", b"_reconstructor") => Item::Global(Global::Reconstructor),
             _ => {
                 let modname = String::from_utf8(modname)
                     .map_err(|_| self.inner_error(ErrorCode::StringNotUTF8))?;
                 let globname = String::from_utf8(globname)
                     .map_err(|_| self.inner_error(ErrorCode::StringNotUTF8))?;
 
-                Value::Global(Global::Other(Box::new((Cow::Owned(modname), Cow::Owned(globname)))))
+                Item::Global(Global::Other(Box::new((
+                    Cow::Owned(modname),
+                    Cow::Owned(globname),
+                ))))
             }
         };
         Ok(value)
     }
 
     // Handle the REDUCE opcode for the few Global objects we support.
-    fn reduce_global(&mut self, global: Value, argtuple: SharedFrozen<Vec<Value>>) -> Result<()> {
-        let mut argtuple = argtuple.into_raw_or_cloned();
+    fn reduce_global(&mut self, global: Item, mut argtuple: Vec<Item>) -> Result<()> {
+        let global = match global {
+            Item::Global(g) => g,
+            other => return Self::stack_error("global reference", &other, self.pos),
+        };
         match global {
-            Value::Global(Global::Set) => match self.resolve(argtuple.pop()) {
-                Some(Value::List(items)) => {
-                    self.stack.push(Value::Set(items));
+            Global::Set => match argtuple.pop().map(Item::into_value_lossy) {
+                Some(V::List(items)) => {
+                    self.push_val(V::Set(Shared::new(Self::to_hashable_set(items))));
                     Ok(())
                 }
                 _ => self.error(ErrorCode::InvalidValue("set() arg".into())),
             },
-            Value::Global(Global::Frozenset) => match self.resolve(argtuple.pop()) {
-                Some(Value::List(items)) => {
-                    self.stack.push(Value::FrozenSet(items.into()));
+            Global::Frozenset => match argtuple.pop().map(Item::into_value_lossy) {
+                Some(V::List(items)) => {
+                    self.push_val(V::FrozenSet(SharedFrozen::new(Self::to_hashable_set(
+                        items,
+                    ))));
                     Ok(())
                 }
                 _ => self.error(ErrorCode::InvalidValue("frozenset() arg".into())),
             },
-            Value::Global(Global::Bytearray) => {
+            Global::Bytearray => {
                 // On Py2, the call is encoded as bytearray(u"foo", "latin-1").
                 argtuple.truncate(1);
-                match self.resolve(argtuple.pop()) {
-                    Some(Value::Bytes(bytes)) => {
-                        self.stack.push(Value::Bytes(bytes));
+                match argtuple.pop().map(Item::into_value_lossy) {
+                    Some(V::Bytes(bytes)) => {
+                        self.push_val(V::Bytes(bytes));
                         Ok(())
                     }
-                    Some(Value::String(string)) => {
+                    Some(V::String(string)) => {
                         // The code points in the string are actually bytes values.
-                        // So we need to collect them individually.
-                        self.stack.push(Value::Bytes(SharedFrozen::new(
+                        self.push_val(V::Bytes(SharedFrozen::new(
                             string.inner().chars().map(|ch| ch as u32 as u8).collect(),
                         )));
                         Ok(())
@@ -1565,83 +1334,81 @@ impl<R: Read> Deserializer<R> {
                     _ => self.error(ErrorCode::InvalidValue("bytearray() arg".into())),
                 }
             }
-            Value::Global(Global::List) => match self.resolve(argtuple.pop()) {
-                Some(Value::List(items)) => {
-                    self.stack.push(Value::List(items));
+            Global::List => match argtuple.pop().map(Item::into_value_lossy) {
+                Some(V::List(items)) => {
+                    self.push_val(V::List(items));
                     Ok(())
                 }
                 _ => self.error(ErrorCode::InvalidValue("list() arg".into())),
             },
-            Value::Global(Global::Int) => match self.resolve(argtuple.pop()) {
-                Some(Value::Int(integer)) => {
-                    self.stack.push(Value::Int(integer));
+            Global::Int => match argtuple.pop().map(Item::into_value_lossy) {
+                Some(V::Int(integer)) => {
+                    self.push_val(V::Int(integer));
                     Ok(())
                 }
                 _ => self.error(ErrorCode::InvalidValue("int() arg".into())),
             },
-            Value::Global(Global::Encode) => {
+            Global::Encode => {
                 // Byte object encoded as _codecs.encode(x, 'latin1')
-                match self.resolve(argtuple.pop()) {
-                    // Encoding, always latin1
-                    Some(Value::String(_)) => {}
+                match argtuple.pop().map(Item::into_value_lossy) {
+                    Some(V::String(_)) => {} // encoding, always latin1
                     _ => return self.error(ErrorCode::InvalidValue("encode() arg".into())),
                 }
-                match self.resolve(argtuple.pop()) {
-                    Some(Value::String(s)) => {
-                        // Now we have to convert the string to latin-1
-                        // encoded bytes.  It never contains codepoints
-                        // above 0xff.
+                match argtuple.pop().map(Item::into_value_lossy) {
+                    Some(V::String(s)) => {
                         let bytes = s.inner().chars().map(|ch| ch as u8).collect();
-                        self.stack.push(Value::Bytes(SharedFrozen::new(bytes)));
+                        self.push_val(V::Bytes(SharedFrozen::new(bytes)));
                         Ok(())
                     }
                     _ => self.error(ErrorCode::InvalidValue("encode() arg".into())),
                 }
             }
-            Value::Global(Global::Reconstructor) => {
-                let _state = self.resolve(argtuple.pop());
-                let _base_cls = self.resolve(argtuple.pop());
-                let cls = self.resolve(argtuple.pop());
-
+            Global::Reconstructor => {
+                let _state = argtuple.pop();
+                let _base_cls = argtuple.pop();
+                let cls = argtuple.pop();
                 if self.options.object_factory.is_some()
                     || self.options.replace_reconstructor_objects_with_dict
                 {
                     let (modname, globname) = match &cls {
-                        Some(Value::Global(Global::Other(names))) => {
-                            (names.0.as_ref(), names.1.as_ref())
+                        Some(Item::Global(Global::Other(names))) => {
+                            (names.0.as_ref().to_owned(), names.1.as_ref().to_owned())
                         }
                         _ => {
-                            return Self::stack_error(
-                                "global reference",
-                                cls.as_ref().unwrap_or(&Value::None),
-                                self.pos,
-                            );
+                            let item = cls.unwrap_or(Item::Value(V::None));
+                            return Self::stack_error("global reference", &item, self.pos);
                         }
                     };
-                    let obj = self.make_object(modname, globname);
+                    let obj = self.make_object(&modname, &globname);
                     self.stack.push(obj);
                 } else {
-                    // If the user doesn't want to replace reconstructor objects, transition this to an unresolved global
-                    // so that we can bubble up unresolved global errors.
-                    self.stack.push(Value::Global(Global::Other(Box::new((
+                    // Keep it as an unresolved global so the error bubbles up.
+                    self.stack.push(Item::Global(Global::Other(Box::new((
                         Cow::Borrowed("copy_reg"),
                         Cow::Borrowed("_reconstructor"),
                     )))));
                 }
                 Ok(())
             }
-            Value::Global(Global::Other(names)) => {
-                // Anything else; just keep it on the stack as an opaque object.
-                // If it is a class object, it will get replaced later when the
-                // class is instantiated.
-                self.stack.push(Value::Global(Global::Other(names)));
+            Global::Other(names) => {
+                // Anything else; keep it on the stack as an opaque global.
+                self.stack.push(Item::Global(Global::Other(names)));
                 Ok(())
             }
-            other => Self::stack_error("global reference", &other, self.pos),
         }
     }
 
-    fn stack_error<T>(what: &'static str, value: &Value, pos: usize) -> Result<T> {
+    // Convert a list of public values into a hashable set, skipping unhashable
+    // elements (matching the old converter's set/frozenset handling).
+    fn to_hashable_set(items: Shared<Vec<V>>) -> BTreeSet<HashableValue> {
+        items
+            .into_raw_or_cloned()
+            .into_iter()
+            .filter_map(|v| v.into_hashable().ok())
+            .collect()
+    }
+
+    fn stack_error<T>(what: &'static str, value: &Item, pos: usize) -> Result<T> {
         let it = format!("{value:?}");
         Err(Error::Eval(ErrorCode::InvalidStackTop(what, it), pos))
     }
@@ -1654,143 +1421,99 @@ impl<R: Read> Deserializer<R> {
         Error::Eval(reason, self.pos)
     }
 
-    fn convert_value(&mut self, value: Value) -> Result<value::Value> {
-        match value {
-            Value::None => Ok(value::Value::None),
-            Value::Bool(v) => Ok(value::Value::Bool(v)),
-            Value::I64(v) => Ok(value::Value::I64(v)),
-            Value::Int(v) => {
-                if let Some(i) = v.to_i64() {
-                    Ok(value::Value::I64(i))
-                } else {
-                    Ok(value::Value::Int(v))
-                }
+    /// Detect reference cycles in the finished value. Identity-memoized DFS
+    /// keyed by container `Rc` pointer, so it visits each unique container once
+    /// (shared subtrees are not re-walked). On a back-edge it errors with
+    /// `Recursive`, unless `replace_recursive_structures` is set (then the cycle
+    /// is tolerated and left as-is). Task 2 will downgrade back-edges to `Weak`.
+    fn break_cycles(&mut self, value: &mut V) -> Result<()> {
+        let mut visited: std::collections::HashSet<*const ()> = std::collections::HashSet::new();
+        let mut path: std::collections::HashSet<*const ()> = std::collections::HashSet::new();
+        detect_cycles(
+            value,
+            self.options.replace_recursive_structures,
+            &mut visited,
+            &mut path,
+        )
+    }
+}
+
+/// Identity of a shared container, or `None` for a leaf value.
+fn container_ptr(v: &V) -> Option<*const ()> {
+    use std::rc::Rc;
+    match v {
+        V::List(s) => Some(s.rc_ptr() as *const ()),
+        V::Dict(s) => Some(s.rc_ptr() as *const ()),
+        V::Set(s) => Some(s.rc_ptr() as *const ()),
+        V::Object(s) => Some(s.rc_ptr() as *const ()),
+        V::Tuple(s) => Some(Rc::as_ptr(s.rc_ref()) as *const ()),
+        V::FrozenSet(s) => Some(Rc::as_ptr(s.rc_ref()) as *const ()),
+        _ => None,
+    }
+}
+
+fn detect_cycles(
+    v: &V,
+    replace: bool,
+    visited: &mut std::collections::HashSet<*const ()>,
+    path: &mut std::collections::HashSet<*const ()>,
+) -> Result<()> {
+    let Some(ptr) = container_ptr(v) else {
+        return Ok(());
+    };
+    if path.contains(&ptr) {
+        return if replace {
+            Ok(())
+        } else {
+            Err(Error::Syntax(ErrorCode::Recursive))
+        };
+    }
+    if !visited.insert(ptr) {
+        return Ok(());
+    }
+    path.insert(ptr);
+    match v {
+        V::List(s) => {
+            for c in s.inner().iter() {
+                detect_cycles(c, replace, visited, path)?;
             }
-            Value::F64(v) => Ok(value::Value::F64(v)),
-            Value::Bytes(v) => Ok(value::Value::Bytes(v)),
-            Value::String(v) => Ok(value::Value::String(v)),
-            Value::List(v) => {
-                let id = v.stable_id();
-
-                if let Some(converted) = self.converted_rc.get(&id) {
-                    return Ok(converted.clone());
-                }
-
-                let new = v
-                    .inner()
-                    .iter()
-                    .map(|v| self.convert_value(v.clone()))
-                    .collect::<Result<_>>();
-
-                let new_shared = Shared::new(new?);
-
-                let new_value = value::Value::List(new_shared.clone());
-                self.converted_rc.insert(id, new_value.clone());
-
-                Ok(new_value)
+        }
+        V::Tuple(s) => {
+            for c in s.inner().iter() {
+                detect_cycles(c, replace, visited, path)?;
             }
-            Value::Tuple(v) => {
-                let id = v.stable_id();
-
-                if let Some(converted) = self.converted_rc.get(&id) {
-                    return Ok(converted.clone());
-                }
-
-                let new = v
-                    .inner()
-                    .iter()
-                    .map(|v| self.convert_value(v.clone()))
-                    .collect::<Result<Vec<_>>>()?;
-
-                let new_shared = SharedFrozen::new(new);
-
-                let new_value = value::Value::Tuple(new_shared.clone());
-                self.converted_rc.insert(id, new_value.clone());
-
-                Ok(new_value)
+        }
+        V::Dict(s) => {
+            for (_, val) in s.inner().iter() {
+                detect_cycles(val, replace, visited, path)?;
             }
-            Value::Set(v) => {
-                let new = v
-                    .inner()
-                    .iter()
-                    .cloned()
-                    .map(|v| self.convert_value(v).and_then(|rv| rv.into_hashable()))
-                    .collect::<Result<_>>();
-                Ok(value::Value::Set(Shared::new(new?)))
-            }
-            Value::FrozenSet(v) => {
-                let new = v
-                    .inner()
-                    .iter()
-                    .cloned()
-                    .map(|v| self.convert_value(v).and_then(|rv| rv.into_hashable()))
-                    .collect::<Result<_>>();
-
-                Ok(value::Value::FrozenSet(SharedFrozen::new(new?)))
-            }
-            Value::Dict(v) => {
-                let id = v.stable_id();
-
-                if let Some(converted) = self.converted_rc.get(&id) {
-                    return Ok(converted.clone());
-                }
-
-                let mut map = value::Dict::new();
-                let v = v.inner();
-                for (key, value) in v.iter() {
-                    let real_key = self
-                        .convert_value(key.clone())
-                        .and_then(|rv| rv.into_hashable())?;
-
-                    let real_value = self.convert_value(value.clone())?;
-                    map.insert(real_key, real_value);
-                }
-
-                let new_shared = Shared::new(map);
-
-                let new_value = value::Value::Dict(new_shared.clone());
-                self.converted_rc.insert(id, new_value.clone());
-
-                Ok(new_value)
-            }
-            Value::Object(o) => Ok(value::Value::Object(Shared::new(o))),
-            Value::MemoRef(memo_id) => {
-                self.resolve_recursive(memo_id, (), |slf, (), value| slf.convert_value(value))
-            }
-            Value::Global(Global::Reconstructor) => {
-                if self.options.object_factory.is_some()
-                    || self.options.replace_reconstructor_objects_with_dict
-                {
-                    let obj = self.make_object("copy_reg", "_reconstructor");
-                    Ok(value::Value::Object(Shared::new(match obj {
-                        Value::Object(o) => o,
-                        _ => unreachable!(),
-                    })))
-                } else {
-                    Err(Error::Syntax(ErrorCode::UnresolvedGlobal))
-                }
-            }
-            Value::Global(_) => {
-                if self.options.replace_unresolved_globals {
-                    Ok(value::Value::None)
-                } else {
-                    Err(Error::Syntax(ErrorCode::UnresolvedGlobal))
+        }
+        V::Object(s) => {
+            let inner = s.inner();
+            if let Some(dict_obj) = inner.as_any().downcast_ref::<DictObject>() {
+                for (_, val) in dict_obj.state().iter() {
+                    detect_cycles(val, replace, visited, path)?;
                 }
             }
         }
+        // Sets/frozensets hold only hashable (immutable) elements, so they can
+        // never participate in a cycle.
+        _ => {}
     }
+    path.remove(&ptr);
+    Ok(())
 }
 
 impl<'de: 'a, 'a, R: Read> de::Deserializer<'de> for &'a mut Deserializer<R> {
     type Error = Error;
 
-    fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+    fn deserialize_any<V2: Visitor<'de>>(self, visitor: V2) -> Result<V2::Value> {
         let value = self.get_next_value()?;
         match value {
-            Value::None => visitor.visit_unit(),
-            Value::Bool(v) => visitor.visit_bool(v),
-            Value::I64(v) => visitor.visit_i64(v),
-            Value::Int(v) => {
+            V::None => visitor.visit_unit(),
+            V::Bool(v) => visitor.visit_bool(v),
+            V::I64(v) => visitor.visit_i64(v),
+            V::Int(v) => {
                 if let Some(i) = v.to_i64() {
                     visitor.visit_i64(i)
                 } else {
@@ -1799,16 +1522,10 @@ impl<'de: 'a, 'a, R: Read> de::Deserializer<'de> for &'a mut Deserializer<R> {
                     )))
                 }
             }
-            Value::F64(v) => visitor.visit_f64(v),
-            Value::Bytes(v) => {
-                let v = v.into_raw_or_cloned();
-                visitor.visit_byte_buf(v)
-            }
-            Value::String(v) => {
-                let v = v.into_raw_or_cloned();
-                visitor.visit_string(v)
-            }
-            Value::List(v) => {
+            V::F64(v) => visitor.visit_f64(v),
+            V::Bytes(v) => visitor.visit_byte_buf(v.into_raw_or_cloned()),
+            V::String(v) => visitor.visit_string(v.into_raw_or_cloned()),
+            V::List(v) => {
                 let v = v.into_raw_or_cloned();
                 let len = v.len();
                 visitor.visit_seq(SeqAccess {
@@ -1817,7 +1534,7 @@ impl<'de: 'a, 'a, R: Read> de::Deserializer<'de> for &'a mut Deserializer<R> {
                     len,
                 })
             }
-            Value::Tuple(v) => {
+            V::Tuple(v) => {
                 let v = v.into_raw_or_cloned();
                 visitor.visit_seq(SeqAccess {
                     len: v.len(),
@@ -1825,59 +1542,60 @@ impl<'de: 'a, 'a, R: Read> de::Deserializer<'de> for &'a mut Deserializer<R> {
                     de: self,
                 })
             }
-            Value::Set(v) => {
-                let v = v.into_raw_or_cloned();
+            V::Set(v) => {
+                let items: Vec<V> = v
+                    .into_raw_or_cloned()
+                    .into_iter()
+                    .map(HashableValue::into_value)
+                    .collect();
+                let len = items.len();
                 visitor.visit_seq(SeqAccess {
                     de: self,
-                    len: v.len(),
-                    iter: v.into_iter(),
+                    len,
+                    iter: items.into_iter(),
                 })
             }
-            Value::FrozenSet(v) => {
-                let v = v.into_raw_or_cloned();
+            V::FrozenSet(v) => {
+                let items: Vec<V> = v
+                    .into_raw_or_cloned()
+                    .into_iter()
+                    .map(HashableValue::into_value)
+                    .collect();
+                let len = items.len();
                 visitor.visit_seq(SeqAccess {
                     de: self,
-                    len: v.len(),
-                    iter: v.into_iter(),
+                    len,
+                    iter: items.into_iter(),
                 })
             }
-            Value::Dict(v) => {
-                let v = v.into_raw_or_cloned();
-                let len = v.len();
+            V::Dict(v) => {
+                let pairs: Vec<(V, V)> = v
+                    .into_raw_or_cloned()
+                    .into_entries()
+                    .into_iter()
+                    .map(|(k, val)| (k.into_value(), val))
+                    .collect();
+                let len = pairs.len();
                 visitor.visit_map(MapAccess {
                     de: self,
-                    iter: v.into_iter(),
+                    iter: pairs.into_iter(),
                     value: None,
                     len,
                 })
             }
-            Value::MemoRef(memo_id) => {
-                self.resolve_recursive(memo_id, visitor, |slf, visitor, value| {
-                    slf.value = Some(value);
-                    slf.deserialize_any(visitor)
-                })
-            }
-            Value::Object(o) => {
-                // Convert to public Value, then use value_impls Deserializer
-                let public_val = o.__reduce__().state_or_none();
+            V::Object(o) => {
+                let public_val = o.inner().__reduce__().state_or_none();
                 let mut de = crate::value_impls::Deserializer::new(public_val);
                 serde::de::Deserializer::deserialize_any(&mut de, visitor)
-            }
-            Value::Global(_) => {
-                if self.options.replace_unresolved_globals {
-                    visitor.visit_unit()
-                } else {
-                    Err(Error::Syntax(ErrorCode::UnresolvedGlobal))
-                }
             }
         }
     }
 
     #[inline]
-    fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+    fn deserialize_option<V2: Visitor<'de>>(self, visitor: V2) -> Result<V2::Value> {
         let value = self.get_next_value()?;
         match value {
-            Value::None => visitor.visit_none(),
+            V::None => visitor.visit_none(),
             _ => {
                 self.value = Some(value);
                 visitor.visit_some(self)
@@ -1919,12 +1637,11 @@ impl<'de: 'a, 'a, R: Read + 'a> de::EnumAccess<'de> for VariantAccess<'a, R> {
     type Error = Error;
     type Variant = Self;
 
-    fn variant_seed<V: de::DeserializeSeed<'de>>(self, seed: V) -> Result<(V::Value, Self)> {
+    fn variant_seed<V2: de::DeserializeSeed<'de>>(self, seed: V2) -> Result<(V2::Value, Self)> {
         let value = self.de.get_next_value()?;
         match value {
-            Value::Tuple(v) => {
+            V::Tuple(v) => {
                 let mut v = v.into_raw_or_cloned();
-
                 if v.len() == 2 {
                     let args = v.pop();
                     self.de.value = v.pop();
@@ -1937,40 +1654,27 @@ impl<'de: 'a, 'a, R: Read + 'a> de::EnumAccess<'de> for VariantAccess<'a, R> {
                     Ok((val, self))
                 }
             }
-            Value::Dict(v) => {
-                let mut v = v.into_raw_or_cloned();
-
-                if v.len() != 1 {
+            V::Dict(v) => {
+                let mut entries = v.into_raw_or_cloned().into_entries();
+                if entries.len() != 1 {
                     Err(Error::Syntax(ErrorCode::Structure(
-                        "enum variants must \
-                                                            have one dict entry"
-                            .into(),
+                        "enum variants must have one dict entry".into(),
                     )))
                 } else {
-                    let (name, args) = v.pop().unwrap();
-                    self.de.value = Some(name);
+                    let (name, args) = entries.pop().unwrap();
+                    self.de.value = Some(name.into_value());
                     let val = seed.deserialize(&mut *self.de)?;
                     self.de.value = Some(args);
                     Ok((val, self))
                 }
             }
-            Value::MemoRef(memo_id) => {
-                self.de.resolve_recursive(memo_id, (), |slf, (), value| {
-                    slf.value = Some(value);
-                    Ok(())
-                })?;
-                // retry with memo resolved
-                self.variant_seed(seed)
-            }
-            s @ Value::String(_) => {
+            s @ V::String(_) => {
                 self.de.value = Some(s);
                 let val = seed.deserialize(&mut *self.de)?;
                 Ok((val, self))
             }
             _ => Err(Error::Syntax(ErrorCode::Structure(
-                "enums must be represented as \
-                                                         dicts or tuples"
-                    .into(),
+                "enums must be represented as dicts or tuples".into(),
             ))),
         }
     }
@@ -2002,7 +1706,7 @@ impl<'de: 'a, 'a, R: Read + 'a> de::VariantAccess<'de> for VariantAccess<'a, R> 
 
 struct SeqAccess<'a, R: Read + 'a> {
     de: &'a mut Deserializer<R>,
-    iter: vec::IntoIter<Value>,
+    iter: vec::IntoIter<V>,
     len: usize,
 }
 
@@ -2030,8 +1734,8 @@ impl<'de: 'a, 'a, R: Read> de::SeqAccess<'de> for SeqAccess<'a, R> {
 
 struct MapAccess<'a, R: Read + 'a> {
     de: &'a mut Deserializer<R>,
-    iter: vec::IntoIter<(Value, Value)>,
-    value: Option<Value>,
+    iter: vec::IntoIter<(V, V)>,
+    value: Option<V>,
     len: usize,
 }
 

@@ -134,8 +134,11 @@ impl Arbitrary for Value {
                 Arbitrary::shrink(v.inner()).map(|x| Value::FrozenSet(SharedFrozen::new(x))),
             ),
             Value::Dict(ref v) => {
-                let entries: Vec<(HashableValue, Value)> =
-                    v.inner().iter().map(|(k, val)| (k.clone(), val.clone())).collect();
+                let entries: Vec<(HashableValue, Value)> = v
+                    .inner()
+                    .iter()
+                    .map(|(k, val)| (k.clone(), val.clone()))
+                    .collect();
                 Box::new(
                     Arbitrary::shrink(&entries)
                         .map(|x| Value::Dict(Shared::new(x.into_iter().collect()))),

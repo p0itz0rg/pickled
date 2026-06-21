@@ -201,7 +201,10 @@ impl PickleObject for DictObject {
             Value::None => {} // No dict state
             other => {
                 // Non-dict state: store under special key
-                self.state.insert(HashableValue::String(SharedFrozen::new("__state__".into())), other);
+                self.state.insert(
+                    HashableValue::String(SharedFrozen::new("__state__".into())),
+                    other,
+                );
             }
         }
 

@@ -271,13 +271,18 @@ pub struct Dict {
 
 impl Dict {
     pub fn new() -> Self {
-        Dict { entries: Vec::new() }
+        Dict {
+            entries: Vec::new(),
+        }
     }
 
     /// Wrap an already-sorted, duplicate-free entry vector without re-checking.
     /// The caller must guarantee the sort-by-key invariant.
     pub fn from_sorted_unchecked(entries: Vec<(HashableValue, Value)>) -> Self {
-        debug_assert!(entries.windows(2).all(|w| w[0].0 < w[1].0), "Dict::from_sorted_unchecked given unsorted entries");
+        debug_assert!(
+            entries.windows(2).all(|w| w[0].0 < w[1].0),
+            "Dict::from_sorted_unchecked given unsorted entries"
+        );
         Dict { entries }
     }
 
@@ -320,6 +325,30 @@ impl Dict {
         }
     }
 
+    /// Bulk-insert a batch of entries (e.g. a whole pickle `SETITEMS`), keeping
+    /// the dict sorted with last-wins on duplicate keys. When the dict starts
+    /// empty -- the common case for a freshly built pickle dict -- the batch is
+    /// sorted once (`O(n log n)`) and taken directly, avoiding `O(n^2)` inserts.
+    pub fn extend_sorted(&mut self, mut batch: Vec<(HashableValue, Value)>) {
+        if batch.is_empty() {
+            return;
+        }
+        if self.entries.is_empty() {
+            batch.sort_by(|a, b| a.0.cmp(&b.0));
+            batch.dedup_by(|later, kept| {
+                later.0.cmp(&kept.0) == Ordering::Equal && {
+                    std::mem::swap(&mut kept.1, &mut later.1);
+                    true
+                }
+            });
+            self.entries = batch;
+        } else {
+            for (k, v) in batch {
+                self.insert(k, v);
+            }
+        }
+    }
+
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (&HashableValue, &Value)> {
         self.entries.iter().map(|(k, v)| (k, v))
     }
@@ -355,9 +384,11 @@ impl FromIterator<(HashableValue, Value)> for Dict {
         // binary-search treat as equal -- `HashableValue`'s cross-type numeric
         // ordering makes e.g. `Bool(true)` and `Int(1)` `Ordering::Equal`.
         entries.sort_by(|a, b| a.0.cmp(&b.0));
-        entries.dedup_by(|later, kept| later.0.cmp(&kept.0) == Ordering::Equal && {
-            std::mem::swap(&mut kept.1, &mut later.1);
-            true
+        entries.dedup_by(|later, kept| {
+            later.0.cmp(&kept.0) == Ordering::Equal && {
+                std::mem::swap(&mut kept.1, &mut later.1);
+                true
+            }
         });
         Dict { entries }
     }
@@ -373,7 +404,10 @@ impl IntoIterator for Dict {
 
 impl<'a> IntoIterator for &'a Dict {
     type Item = (&'a HashableValue, &'a Value);
-    type IntoIter = std::iter::Map<std::slice::Iter<'a, (HashableValue, Value)>, fn(&'a (HashableValue, Value)) -> (&'a HashableValue, &'a Value)>;
+    type IntoIter = std::iter::Map<
+        std::slice::Iter<'a, (HashableValue, Value)>,
+        fn(&'a (HashableValue, Value)) -> (&'a HashableValue, &'a Value),
+    >;
     fn into_iter(self) -> Self::IntoIter {
         self.entries.iter().map(|(k, v)| (k, v))
     }

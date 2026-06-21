@@ -24,9 +24,7 @@ use pickled::DeOptions;
 use pickled::HashableValue;
 use pickled::PickleObject;
 use pickled::Value;
-use pickled::{
-    self,
-};
+use pickled::{self};
 
 // ---------------------------------------------------------------------------
 // RSS measurement
