@@ -482,6 +482,46 @@ mod value_tests {
     }
 
     #[test]
+    fn recursive_value_serializes_without_overflow() {
+        // A recursive structure parses to a Weak back-edge by default; serializing
+        // it must NOT follow the back-edge (which would recurse forever / abort).
+        let data = std::fs::read("test/data/test_recursive_proto2.pickle").unwrap();
+        let value = value_from_slice(&data, Default::default()).unwrap();
+        let bytes = value_to_vec(&value, Default::default()).expect("pickle serialize");
+        assert!(!bytes.is_empty());
+        // serde path too (used by serde_json etc).
+        let _ = format!("{value}");
+    }
+
+    #[test]
+    fn nested_unresolved_global_errors_by_default() {
+        // `((unresolved_global,),)` -- a global nested two tuples deep. The old
+        // converter errored on an unresolved global at any depth; the single-pass
+        // parser must too (not silently map it to None).
+        let data = b"\x80\x02cmymod\nMyClass\n\x85\x85.";
+        assert!(
+            value_from_slice(data, Default::default()).is_err(),
+            "nested unresolved global must error by default"
+        );
+        // With the replace option it is allowed (becomes None).
+        assert!(
+            value_from_slice(data, DeOptions::new().replace_unresolved_globals()).is_ok(),
+            "replace_unresolved_globals should permit it"
+        );
+    }
+
+    #[test]
+    fn object_self_cycle_does_not_crash() {
+        // An object whose state refers back to itself (`n.self_ref = n`). The
+        // cycle-breaker must turn the back-edge into a Weak inside object state,
+        // so Display/serialize do not recurse forever.
+        let data = std::fs::read("test/data/test_object_cycle_proto2.pickle").unwrap();
+        let value = value_from_slice(&data, Default::default()).unwrap();
+        let _ = format!("{value}");
+        let _ = value_to_vec(&value, Default::default()).expect("pickle serialize");
+    }
+
+    #[test]
     fn fuzzing() {
         // Tries to ensure that we don't panic when encountering strange streams.
         for _ in 0..1000 {

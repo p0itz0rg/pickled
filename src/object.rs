@@ -98,6 +98,14 @@ pub trait PickleObject: fmt::Debug + fmt::Display {
 
     /// Downcast support.
     fn as_any(&self) -> &dyn Any;
+
+    /// Mutable downcast support, used by the cycle-breaker to replace a
+    /// recursive back-edge inside object state with a `Weak`. Default `None`
+    /// keeps custom objects' state read-only (a back-edge into them is broken to
+    /// `None` instead); implement it to allow in-place cycle breaking.
+    fn as_any_mut(&mut self) -> Option<&mut dyn Any> {
+        None
+    }
 }
 
 /// Context passed to the `ObjectFactory` when a class instance is being constructed.
@@ -144,6 +152,12 @@ impl DictObject {
     /// Access the internal state dictionary (entries sorted by key).
     pub fn state(&self) -> &Dict {
         &self.state
+    }
+
+    /// Mutable access to the state dictionary. Used by the cycle-breaker to
+    /// replace a recursive back-edge value in place.
+    pub fn state_mut(&mut self) -> &mut Dict {
+        &mut self.state
     }
 
     /// Look up a state entry by key.
@@ -281,5 +295,9 @@ impl PickleObject for DictObject {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn as_any_mut(&mut self) -> Option<&mut dyn Any> {
+        Some(self)
     }
 }

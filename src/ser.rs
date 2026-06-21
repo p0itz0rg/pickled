@@ -159,10 +159,9 @@ impl<W: io::Write> Serializer<W> {
             Value::Set(ref s) => self.serialize_set(&s.inner(), b"set"),
             Value::FrozenSet(ref s) => self.serialize_set(s.inner(), b"frozenset"),
             Value::Object(ref o) => self.serialize_object(o.inner().as_ref()),
-            Value::Weak(ref w) => match w.upgrade() {
-                Some(v) => self.serialize_value(&v),
-                None => self.serialize_unit(),
-            },
+            // A recursive back-edge has no finite serialization; emit None
+            // rather than following `upgrade()` (which would recurse forever).
+            Value::Weak(_) => self.serialize_unit(),
         }
     }
 
@@ -927,10 +926,9 @@ impl Serialize for Value {
                 map.end()
             }
             Value::Object(ref o) => o.inner().__reduce__().state_or_none().serialize(serializer),
-            Value::Weak(ref w) => match w.upgrade() {
-                Some(v) => v.serialize(serializer),
-                None => serializer.serialize_none(),
-            },
+            // A recursive back-edge has no finite serialization; emit None
+            // rather than following `upgrade()` (which would recurse forever).
+            Value::Weak(_) => serializer.serialize_none(),
         }
     }
 }

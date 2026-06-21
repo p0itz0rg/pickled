@@ -339,20 +339,39 @@ impl Dict {
         if batch.is_empty() {
             return;
         }
+        batch.sort_by(|a, b| a.0.cmp(&b.0));
+        batch.dedup_by(|later, kept| {
+            later.0.cmp(&kept.0) == Ordering::Equal && {
+                std::mem::swap(&mut kept.1, &mut later.1);
+                true
+            }
+        });
         if self.entries.is_empty() {
-            batch.sort_by(|a, b| a.0.cmp(&b.0));
-            batch.dedup_by(|later, kept| {
-                later.0.cmp(&kept.0) == Ordering::Equal && {
-                    std::mem::swap(&mut kept.1, &mut later.1);
-                    true
-                }
-            });
             self.entries = batch;
-        } else {
-            for (k, v) in batch {
-                self.insert(k, v);
+            return;
+        }
+        // Merge two sorted, duplicate-free sequences in O(n + m); the batch
+        // holds the later writes, so it wins ties.
+        let old = std::mem::take(&mut self.entries);
+        let mut merged = Vec::with_capacity(old.len() + batch.len());
+        let mut oi = old.into_iter().peekable();
+        let mut bi = batch.into_iter().peekable();
+        loop {
+            match (oi.peek(), bi.peek()) {
+                (Some(o), Some(b)) => match o.0.cmp(&b.0) {
+                    Ordering::Less => merged.push(oi.next().unwrap()),
+                    Ordering::Greater => merged.push(bi.next().unwrap()),
+                    Ordering::Equal => {
+                        oi.next();
+                        merged.push(bi.next().unwrap());
+                    }
+                },
+                (Some(_), None) => merged.push(oi.next().unwrap()),
+                (None, Some(_)) => merged.push(bi.next().unwrap()),
+                (None, None) => break,
             }
         }
+        self.entries = merged;
     }
 
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (&HashableValue, &Value)> {
@@ -560,6 +579,9 @@ impl PartialEq for Value {
             (Value::Object(a), Value::Object(b)) => {
                 a.ptr_eq(b) || a.inner().eq_dyn(b.inner().as_ref())
             }
+            // Back-edges are equal iff they point at the same container. Do not
+            // follow/upgrade (a cycle would recurse forever).
+            (Value::Weak(a), Value::Weak(b)) => a.as_ptr() == b.as_ptr(),
             _ => false,
         }
     }

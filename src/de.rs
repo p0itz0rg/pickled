@@ -279,7 +279,7 @@ pub struct Deserializer<R: Read> {
     // sequentially; PUT/BINPUT use small explicit ids), so direct indexing
     // avoids the per-node overhead of a BTreeMap over a large memo. Absent
     // slots are `None`.
-    memo: Vec<Option<(Item, i32)>>,
+    memo: Vec<Option<Item>>,
     stack: Vec<Item>,                // topmost items on the stack
     stacks: Vec<Vec<Item>>,          // items further down the stack, between MARKs
     strings_rc: HashMap<Vec<u8>, V>, // content-dedup of decoded strings
@@ -359,18 +359,18 @@ impl<R: Read> Deserializer<R> {
         self.memo.clear();
     }
 
-    fn memo_get(&self, id: MemoId) -> Option<&(Item, i32)> {
+    fn memo_get(&self, id: MemoId) -> Option<&Item> {
         self.memo.get(id as usize).and_then(Option::as_ref)
     }
 
     /// Insert (or overwrite) a memo entry, growing the backing vec with `None`
     /// holes as needed.
-    fn memo_insert(&mut self, id: MemoId, entry: (Item, i32)) {
+    fn memo_insert(&mut self, id: MemoId, item: Item) {
         let idx = id as usize;
         if idx >= self.memo.len() {
             self.memo.resize_with(idx + 1, || None);
         }
-        self.memo[idx] = Some(entry);
+        self.memo[idx] = Some(item);
     }
 
     /// Decode a Value from this pickle.  This is different from going through
@@ -388,14 +388,21 @@ impl<R: Read> Deserializer<R> {
     /// Convert an item to a public value for placement into a container or as
     /// the result, flagging unresolved globals so the caller can error.
     fn demote(&mut self, item: Item) -> V {
-        match &item {
-            Item::Global(_) => self.saw_unresolved_global = true,
-            Item::Args(items) if items.iter().any(|i| matches!(i, Item::Global(_))) => {
-                self.saw_unresolved_global = true;
-            }
-            _ => {}
+        if Self::item_contains_global(&item) {
+            self.saw_unresolved_global = true;
         }
         item.into_value_lossy()
+    }
+
+    /// Whether an item is, or transitively (through `Args` nesting) contains, a
+    /// bare unresolved global -- which `into_value_lossy` would silently map to
+    /// `None`. The old converter errored on these at any depth.
+    fn item_contains_global(item: &Item) -> bool {
+        match item {
+            Item::Global(_) => true,
+            Item::Args(items) => items.iter().any(Self::item_contains_global),
+            Item::Value(_) => false,
+        }
     }
 
     /// Get the next value to deserialize, either by parsing the pickle stream
@@ -866,7 +873,7 @@ impl<R: Read> Deserializer<R> {
     // mutation (APPEND/SETITEM/BUILD) updates both.
     fn get_memo(&mut self, memo_id: MemoId) -> Result<()> {
         match self.memo_get(memo_id) {
-            Some((item, _)) => {
+            Some(item) => {
                 let item = item.clone();
                 self.stack.push(item);
                 Ok(())
@@ -879,7 +886,7 @@ impl<R: Read> Deserializer<R> {
     // (a cheap `Rc` clone is stored, sharing identity with the stack value).
     fn memoize_next(&mut self, memo_id: MemoId) -> Result<()> {
         let item = self.pop()?;
-        self.memo_insert(memo_id, (item.clone(), 1));
+        self.memo_insert(memo_id, item.clone());
         self.stack.push(item);
         Ok(())
     }
@@ -1437,10 +1444,14 @@ impl<R: Read> Deserializer<R> {
             self.options.replace_recursive_structures,
             &mut visited,
             &mut path,
-        );
-        Ok(())
+            0,
+        )
     }
 }
+
+/// Recursion ceiling for the cycle-breaker, well above any real pickle nesting;
+/// exceeding it returns a clean error instead of overflowing the stack.
+const MAX_CYCLE_DEPTH: usize = 100_000;
 
 /// Identity of a shared container, or `None` for a leaf value.
 fn container_ptr(v: &V) -> Option<*const ()> {
@@ -1463,9 +1474,10 @@ fn fix_or_recurse(
     replace: bool,
     visited: &mut HashSet<*const ()>,
     path: &mut HashSet<*const ()>,
-) {
+    depth: usize,
+) -> Result<()> {
     let Some(cptr) = container_ptr(slot) else {
-        return;
+        return Ok(());
     };
     if path.contains(&cptr) {
         *slot = if replace {
@@ -1475,8 +1487,9 @@ fn fix_or_recurse(
                 .map(V::Weak)
                 .unwrap_or(V::None)
         };
+        Ok(())
     } else {
-        break_walk(slot, replace, visited, path);
+        break_walk(slot, replace, visited, path, depth)
     }
 }
 
@@ -1485,23 +1498,27 @@ fn break_walk(
     replace: bool,
     visited: &mut HashSet<*const ()>,
     path: &mut HashSet<*const ()>,
-) {
+    depth: usize,
+) -> Result<()> {
     let Some(ptr) = container_ptr(v) else {
-        return;
+        return Ok(());
     };
+    if depth > MAX_CYCLE_DEPTH {
+        return Err(Error::Syntax(ErrorCode::Recursive));
+    }
     if !visited.insert(ptr) {
-        return;
+        return Ok(());
     }
     path.insert(ptr);
     match v {
         V::List(s) => {
             for slot in s.inner_mut().iter_mut() {
-                fix_or_recurse(slot, replace, visited, path);
+                fix_or_recurse(slot, replace, visited, path, depth + 1)?;
             }
         }
         V::Dict(s) => {
             for slot in s.inner_mut().values_mut() {
-                fix_or_recurse(slot, replace, visited, path);
+                fix_or_recurse(slot, replace, visited, path, depth + 1)?;
             }
         }
         // Tuples are immutable: we cannot replace a direct back-edge slot, but we
@@ -1511,22 +1528,21 @@ fn break_walk(
                 if let Some(cptr) = container_ptr(child)
                     && !path.contains(&cptr)
                 {
-                    break_walk(child, replace, visited, path);
+                    break_walk(child, replace, visited, path, depth + 1)?;
                 }
             }
         }
-        // Object state is read through the trait; recurse to break cycles in
-        // nested mutable containers (a direct back-edge into object state is
-        // left strong -- only reachable from exotic hand-built pickles).
+        // Object state (DictObject) is mutated in place so a direct back-edge
+        // into it is also broken to a `Weak`, leaving no strong cycle. Custom
+        // objects (no mutable-any) are not traversed.
         V::Object(s) => {
-            let inner = s.inner();
-            if let Some(dict_obj) = inner.as_any().downcast_ref::<DictObject>() {
-                for (_, child) in dict_obj.state().iter() {
-                    if let Some(cptr) = container_ptr(child)
-                        && !path.contains(&cptr)
-                    {
-                        break_walk(child, replace, visited, path);
-                    }
+            let mut inner = s.inner_mut();
+            if let Some(dict_obj) = inner
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<DictObject>())
+            {
+                for slot in dict_obj.state_mut().values_mut() {
+                    fix_or_recurse(slot, replace, visited, path, depth + 1)?;
                 }
             }
         }
@@ -1534,6 +1550,7 @@ fn break_walk(
         _ => {}
     }
     path.remove(&ptr);
+    Ok(())
 }
 
 impl<'de: 'a, 'a, R: Read> de::Deserializer<'de> for &'a mut Deserializer<R> {
