@@ -304,7 +304,12 @@ pub struct Deserializer<R: Read> {
     options: DeOptions,
     pos: usize,
     value: Option<Value>,                     // next value to deserialize
-    memo: BTreeMap<MemoId, (Value, i32)>,     // pickle memo (value, number of refs)
+    // Pickle memo (value, number of refs), indexed by memo id. A flat Vec
+    // rather than a BTreeMap: memo ids are dense (MEMOIZE assigns them
+    // sequentially; PUT/BINPUT use small explicit ids), so direct indexing
+    // avoids the per-node overhead of a BTreeMap over a large memo. Absent
+    // slots are `None` (e.g. after `resolve_recursive` takes a value).
+    memo: Vec<Option<(Value, i32)>>,
     stack: Vec<Value>,                        // topmost items on the stack
     stacks: Vec<Vec<Value>>,                  // items further down the stack, between MARKs
     converted_rc: HashMap<u64, value::Value>, // shared items that have already been converted
@@ -319,7 +324,7 @@ impl<R: Read> Deserializer<R> {
             rdr: BufReader::new(rdr),
             pos: 0,
             value: None,
-            memo: BTreeMap::new(),
+            memo: Vec::new(),
             stack: Vec::with_capacity(128),
             stacks: Vec::with_capacity(16),
             options,
@@ -380,6 +385,28 @@ impl<R: Read> Deserializer<R> {
     /// ```
     pub fn reset_memo(&mut self) {
         self.memo.clear();
+    }
+
+    fn memo_get(&self, id: MemoId) -> Option<&(Value, i32)> {
+        self.memo.get(id as usize).and_then(Option::as_ref)
+    }
+
+    fn memo_get_mut(&mut self, id: MemoId) -> Option<&mut (Value, i32)> {
+        self.memo.get_mut(id as usize).and_then(Option::as_mut)
+    }
+
+    /// Insert (or overwrite) a memo entry, growing the backing vec with `None`
+    /// holes as needed. Returns the previous entry at that id, if any.
+    fn memo_insert(&mut self, id: MemoId, entry: (Value, i32)) -> Option<(Value, i32)> {
+        let idx = id as usize;
+        if idx >= self.memo.len() {
+            self.memo.resize_with(idx + 1, || None);
+        }
+        self.memo[idx].replace(entry)
+    }
+
+    fn memo_remove(&mut self, id: MemoId) -> Option<(Value, i32)> {
+        self.memo.get_mut(id as usize).and_then(Option::take)
     }
 
     /// Decode a Value from this pickle.  This is different from going through
@@ -806,14 +833,14 @@ impl<R: Read> Deserializer<R> {
                         Value::MemoRef(id) => {
                             // Check if the memo'd value is an Object
                             let is_object =
-                                matches!(self.memo.get(&id), Some((Value::Object(_), _)));
+                                matches!(self.memo_get(id), Some((Value::Object(_), _)));
                             if is_object {
                                 // Convert state before mutably borrowing memo
                                 let public_state = self.de_value_to_public_value(resolved_state);
-                                if let Some((Value::Object(o), _)) = self.memo.get_mut(&id) {
+                                if let Some((Value::Object(o), _)) = self.memo_get_mut(id) {
                                     o.__setstate__(public_state);
                                 }
-                                let updated = self.memo.get(&id).unwrap().0.clone();
+                                let updated = self.memo_get(id).unwrap().0.clone();
                                 self.stack.push(updated);
                             } else {
                                 self.memoize(id, state.clone())?;
@@ -867,7 +894,8 @@ impl<R: Read> Deserializer<R> {
             // MemoRef variant.
             Some(&mut Value::MemoRef(n)) => self
                 .memo
-                .get_mut(&n)
+                .get_mut(n as usize)
+                .and_then(Option::as_mut)
                 .map(|&mut (ref mut v, _)| v)
                 .ok_or(Error::Syntax(ErrorCode::MissingMemo(n))),
             Some(other_value) => Ok(other_value),
@@ -878,7 +906,7 @@ impl<R: Read> Deserializer<R> {
     // Pushes a memo reference on the stack, and increases the usage counter.
     fn push_memo_ref(&mut self, memo_id: MemoId) -> Result<()> {
         self.stack.push(Value::MemoRef(memo_id));
-        match self.memo.get_mut(&memo_id) {
+        match self.memo_get_mut(memo_id) {
             Some(&mut (_, ref mut count)) => {
                 if MEMO_REF_COUNTING {
                     *count += 1;
@@ -901,12 +929,12 @@ impl<R: Read> Deserializer<R> {
     fn memoize(&mut self, memo_id: MemoId, mut item: Value) -> Result<()> {
         if let Value::MemoRef(id) = item {
             // TODO: is this even possible?
-            item = match self.memo.get(&id) {
+            item = match self.memo_get(id) {
                 Some((v, _)) => v.clone(),
                 None => return Err(Error::Eval(ErrorCode::MissingMemo(id), self.pos)),
             };
         }
-        self.memo.insert(memo_id, (item, 1));
+        self.memo_insert(memo_id, (item, 1));
         Ok(())
     }
 
@@ -914,7 +942,7 @@ impl<R: Read> Deserializer<R> {
     fn resolve(&mut self, maybe_memo: Option<Value>) -> Option<Value> {
         match maybe_memo {
             Some(Value::MemoRef(id)) => {
-                self.memo.get_mut(&id).map(|&mut (ref val, ref mut count)| {
+                self.memo_get_mut(id).map(|&mut (ref val, ref mut count)| {
                     if MEMO_REF_COUNTING {
                         // We can't remove it from the memo here, since we haven't
                         // decoded the whole stream yet and there may be further
@@ -936,7 +964,7 @@ impl<R: Read> Deserializer<R> {
         // Take the value from the memo while visiting it.  This prevents us
         // from trying to depickle recursive structures, which we can't do
         // because our Values aren't references.
-        let (value, mut count) = match self.memo.remove(&id) {
+        let (value, mut count) = match self.memo_remove(id) {
             Some(entry) => entry,
             None => {
                 return if self.options.replace_recursive_structures {
@@ -954,7 +982,7 @@ impl<R: Read> Deserializer<R> {
             // No need to put it back.
         } else {
             let result = f(self, u, value.clone());
-            assert!(self.memo.insert(id, (value, count)).is_none());
+            assert!(self.memo_insert(id, (value, count)).is_none());
             result
         }
     }
@@ -1279,7 +1307,7 @@ impl<R: Read> Deserializer<R> {
     fn de_value_to_public_value(&mut self, v: Value) -> value::Value {
         // Resolve MemoRef first
         let v = match v {
-            Value::MemoRef(id) => match self.memo.get(&id) {
+            Value::MemoRef(id) => match self.memo_get(id) {
                 Some((val, _)) => val.clone(),
                 None => return value::Value::None,
             },
