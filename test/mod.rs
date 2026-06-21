@@ -11,7 +11,7 @@ macro_rules! pyobj {
     (b=True)     => { Value::Bool(true) };
     (b=False)    => { Value::Bool(false) };
     (i=$i:expr)  => { Value::I64($i) };
-    (ii=$i:expr) => { Value::Int($i.clone()) };
+    (ii=$i:expr) => { Value::Int(Box::new($i.clone())) };
     (f=$f:expr)  => { Value::F64($f) };
     (bb=$b:expr) => { Value::Bytes(crate::value::SharedFrozen::new($b.to_vec())) };
     (s=$s:expr)  => { Value::String(crate::value::SharedFrozen::new($s.to_string())) };
@@ -20,7 +20,7 @@ macro_rules! pyobj {
     (ss=($($m:ident=$v:tt),*)) => { Value::Set(crate::value::Shared::new(BTreeSet::from_iter(vec![$(hpyobj!($m=$v)),*]))) };
     (fs=($($m:ident=$v:tt),*)) => { Value::FrozenSet(crate::value::SharedFrozen::new(BTreeSet::from_iter(vec![$(hpyobj!($m=$v)),*]))) };
     (d={$($km:ident=$kv:tt => $vm:ident=$vv:tt),*}) => {
-        Value::Dict(crate::value::Shared::new(BTreeMap::from_iter(vec![$((hpyobj!($km=$kv),
+        Value::Dict(crate::value::Shared::new(crate::value::Dict::from_iter(vec![$((hpyobj!($km=$kv),
                                                 pyobj!($vm=$vv))),*]))) };
 }
 
@@ -29,7 +29,7 @@ macro_rules! hpyobj {
     (b=True)     => { HashableValue::Bool(true) };
     (b=False)    => { HashableValue::Bool(false) };
     (i=$i:expr)  => { HashableValue::I64($i) };
-    (ii=$i:expr) => { HashableValue::Int($i.clone()) };
+    (ii=$i:expr) => { HashableValue::Int(Box::new($i.clone())) };
     (f=$f:expr)  => { HashableValue::F64($f) };
     (bb=$b:expr) => { HashableValue::Bytes(crate::value::SharedFrozen::new($b.to_vec())) };
     (s=$s:expr)  => { HashableValue::String(crate::value::SharedFrozen::new($s.to_string())) };
@@ -326,7 +326,6 @@ mod value_tests {
     use quickcheck::QuickCheck;
     use rand::RngCore;
     use rand::rng;
-    use std::collections::BTreeMap;
     use std::collections::BTreeSet;
     use std::fs::File;
     use std::iter::FromIterator;
@@ -907,21 +906,21 @@ mod value_tests {
 
         // 2^53 is exactly representable as f64
         assert_eq!(
-            HashableValue::Int(two_53.clone()),
+            HashableValue::Int(Box::new(two_53.clone())),
             HashableValue::F64(two_53_f)
         );
 
         // 2^53 + 1 loses precision in f64; the int is strictly greater
         let two_53_plus_1 = &two_53 + BigInt::from(1);
         assert_ne!(
-            HashableValue::Int(two_53_plus_1.clone()),
+            HashableValue::Int(Box::new(two_53_plus_1.clone())),
             HashableValue::F64(two_53_f)
         );
-        assert!(HashableValue::Int(two_53_plus_1) > HashableValue::F64(two_53_f));
+        assert!(HashableValue::Int(Box::new(two_53_plus_1)) > HashableValue::F64(two_53_f));
 
         let huge = BigInt::from(2).pow(100);
-        assert!(HashableValue::Int(huge.clone()) > HashableValue::F64(1.0e30));
-        assert!(HashableValue::Int(-huge) < HashableValue::F64(-1.0e30));
+        assert!(HashableValue::Int(Box::new(huge.clone())) > HashableValue::F64(1.0e30));
+        assert!(HashableValue::Int(Box::new(-huge)) < HashableValue::F64(-1.0e30));
     }
 
     #[test]

@@ -25,7 +25,7 @@ fn gen_value(g: &mut Gen, depth: u32) -> Value {
         0 => Value::None,
         1 => Value::Bool(Arbitrary::arbitrary(g)),
         2 => Value::I64(Arbitrary::arbitrary(g)),
-        3 => Value::Int(gen_bigint(g)),
+        3 => Value::Int(Box::new(gen_bigint(g))),
         4 => Value::F64(Arbitrary::arbitrary(g)),
         5 => Value::Bytes(SharedFrozen::new(Arbitrary::arbitrary(g))),
         6 => Value::String(SharedFrozen::new(Arbitrary::arbitrary(g))),
@@ -76,7 +76,7 @@ fn gen_hvalue(g: &mut Gen, depth: u32) -> HashableValue {
             // We have to construct a value outside of i64 range.
             let val: i64 = Arbitrary::arbitrary(g);
             let max = BigInt::from(i64::MAX);
-            HashableValue::Int(BigInt::from(val) + BigInt::from(2) * max)
+            HashableValue::Int(Box::new(BigInt::from(val) + BigInt::from(2) * max))
         }
         4 => HashableValue::F64(Arbitrary::arbitrary(g)),
         5 => HashableValue::Bytes(SharedFrozen::new(Arbitrary::arbitrary(g))),
@@ -134,7 +134,12 @@ impl Arbitrary for Value {
                 Arbitrary::shrink(v.inner()).map(|x| Value::FrozenSet(SharedFrozen::new(x))),
             ),
             Value::Dict(ref v) => {
-                Box::new(Arbitrary::shrink(&*v.inner()).map(|x| Value::Dict(Shared::new(x))))
+                let entries: Vec<(HashableValue, Value)> =
+                    v.inner().iter().map(|(k, val)| (k.clone(), val.clone())).collect();
+                Box::new(
+                    Arbitrary::shrink(&entries)
+                        .map(|x| Value::Dict(Shared::new(x.into_iter().collect()))),
+                )
             }
             Value::Object(_) => empty_shrinker(),
         }

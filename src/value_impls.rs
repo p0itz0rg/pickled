@@ -13,8 +13,6 @@ use serde::de::Visitor;
 use serde::forward_to_deserialize_any;
 use serde::ser;
 use serde::ser::Serialize;
-use std::collections::BTreeMap;
-use std::collections::btree_map;
 use std::fmt;
 use std::result::Result as StdResult;
 use std::vec;
@@ -22,6 +20,7 @@ use std::vec;
 use crate::error::Error;
 use crate::error::ErrorCode;
 use crate::error::Result;
+use crate::value::Dict;
 use crate::value::HashableValue;
 use crate::value::Shared;
 use crate::value::SharedFrozen;
@@ -55,7 +54,7 @@ impl<'de> de::Deserialize<'de> for Value {
                 if value < 0x8000_0000_0000_0000 {
                     Ok(Value::I64(value as i64))
                 } else {
-                    Ok(Value::Int(BigInt::from(value)))
+                    Ok(Value::Int(Box::new(BigInt::from(value))))
                 }
             }
 
@@ -116,7 +115,7 @@ impl<'de> de::Deserialize<'de> for Value {
                 self,
                 mut visitor: V,
             ) -> StdResult<Value, V::Error> {
-                let mut values = BTreeMap::new();
+                let mut values = Dict::new();
                 while let Some((key, value)) = visitor.next_entry()? {
                     values.insert(key, value);
                 }
@@ -156,7 +155,7 @@ impl<'de> de::Deserialize<'de> for HashableValue {
                 if value < 0x8000_0000_0000_0000 {
                     Ok(HashableValue::I64(value as i64))
                 } else {
-                    Ok(HashableValue::Int(BigInt::from(value)))
+                    Ok(HashableValue::Int(Box::new(BigInt::from(value))))
                 }
             }
 
@@ -461,7 +460,7 @@ impl<'de: 'a, 'a> de::SeqAccess<'de> for SeqDeserializer<'a> {
 
 struct MapDeserializer<'a> {
     de: &'a mut Deserializer,
-    iter: btree_map::IntoIter<HashableValue, Value>,
+    iter: std::vec::IntoIter<(HashableValue, Value)>,
     value: Option<Value>,
     len: usize,
 }
@@ -570,7 +569,7 @@ impl<'a> ser::SerializeTupleVariant for SerializeTupleVariant<'a> {
 
     #[inline]
     fn end(self) -> Result<Value> {
-        let mut d = BTreeMap::new();
+        let mut d = Dict::new();
         d.insert(
             HashableValue::String(SharedFrozen::new(self.variant.into())),
             Value::List(Shared::new(self.state)),
@@ -583,7 +582,7 @@ pub struct SerializeMap<'a> {
     ser: &'a mut Serializer,
     variant: &'a str,
     key: Option<HashableValue>,
-    state: BTreeMap<HashableValue, Value>,
+    state: Dict,
 }
 
 impl<'a> ser::SerializeMap for SerializeMap<'a> {
@@ -649,7 +648,7 @@ impl<'a> ser::SerializeStructVariant for SerializeMap<'a> {
 
     #[inline]
     fn end(self) -> Result<Value> {
-        let mut d = BTreeMap::new();
+        let mut d = Dict::new();
         d.insert(
             HashableValue::String(SharedFrozen::new(self.variant.into())),
             Value::Dict(Shared::new(self.state)),
@@ -715,7 +714,7 @@ impl<'a> ser::Serializer for &'a mut Serializer {
         Ok(if value < 0x8000_0000_0000_0000 {
             Value::I64(value as i64)
         } else {
-            Value::Int(BigInt::from(value))
+            Value::Int(Box::new(BigInt::from(value)))
         })
     }
 
@@ -783,7 +782,7 @@ impl<'a> ser::Serializer for &'a mut Serializer {
         variant: &'static str,
         value: &T,
     ) -> Result<Value> {
-        let mut d = BTreeMap::new();
+        let mut d = Dict::new();
         d.insert(
             HashableValue::String(SharedFrozen::new(variant.into())),
             to_value(&value)?,
@@ -847,7 +846,7 @@ impl<'a> ser::Serializer for &'a mut Serializer {
             ser: self,
             variant: "",
             key: None,
-            state: BTreeMap::new(),
+            state: Dict::new(),
         })
     }
 
@@ -857,7 +856,7 @@ impl<'a> ser::Serializer for &'a mut Serializer {
             ser: self,
             variant: "",
             key: None,
-            state: BTreeMap::new(),
+            state: Dict::new(),
         })
     }
 
@@ -873,7 +872,7 @@ impl<'a> ser::Serializer for &'a mut Serializer {
             ser: self,
             variant,
             key: None,
-            state: BTreeMap::new(),
+            state: Dict::new(),
         })
     }
 }

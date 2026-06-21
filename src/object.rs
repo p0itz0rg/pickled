@@ -2,11 +2,11 @@
 
 use std::any::Any;
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::error::Error;
 use crate::error::ErrorCode;
+use crate::value::Dict;
 use crate::value::HashableValue;
 use crate::value::Shared;
 use crate::value::SharedFrozen;
@@ -127,7 +127,9 @@ pub type ObjectFactory = Box<dyn Fn(ObjectConstructionInfo<'_>) -> Option<Box<dy
 pub struct DictObject {
     module: String,
     class: String,
-    state: BTreeMap<HashableValue, Value>,
+    /// Restored object state, stored as a sorted [`Dict`] (a flat `Vec`, not a
+    /// `BTreeMap`) so the many tiny state maps in a typical pickle stay compact.
+    state: Dict,
 }
 
 impl DictObject {
@@ -135,13 +137,18 @@ impl DictObject {
         DictObject {
             module,
             class,
-            state: BTreeMap::new(),
+            state: Dict::new(),
         }
     }
 
-    /// Access the internal state dictionary.
-    pub fn state(&self) -> &BTreeMap<HashableValue, Value> {
+    /// Access the internal state dictionary (entries sorted by key).
+    pub fn state(&self) -> &Dict {
         &self.state
+    }
+
+    /// Look up a state entry by key.
+    pub fn get(&self, key: &HashableValue) -> Option<&Value> {
+        self.state.get(key)
     }
 
     /// Convert this object into a `Value::Dict` containing the state.
@@ -182,24 +189,28 @@ impl PickleObject for DictObject {
         match dict_state {
             Value::Dict(d) => {
                 let d = d.inner();
-                self.state
-                    .extend(d.iter().map(|(k, v)| (k.clone(), v.clone())));
+                if self.state.is_empty() {
+                    // Source is already sorted; collect directly into the Dict.
+                    self.state = d.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                } else {
+                    for (k, v) in d.iter() {
+                        self.state.insert(k.clone(), v.clone());
+                    }
+                }
             }
             Value::None => {} // No dict state
             other => {
                 // Non-dict state: store under special key
-                self.state.insert(
-                    HashableValue::String(SharedFrozen::new("__state__".into())),
-                    other,
-                );
+                self.state.insert(HashableValue::String(SharedFrozen::new("__state__".into())), other);
             }
         }
 
         // Apply slot_state (setattr equivalent)
         if let Some(Value::Dict(d)) = slot_state {
             let d = d.inner();
-            self.state
-                .extend(d.iter().map(|(k, v)| (k.clone(), v.clone())));
+            for (k, v) in d.iter() {
+                self.state.insert(k.clone(), v.clone());
+            }
         }
     }
 

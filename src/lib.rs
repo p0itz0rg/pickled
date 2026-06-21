@@ -84,6 +84,7 @@ pub use self::de::value_from_iter;
 pub use self::de::value_from_reader;
 pub use self::de::value_from_slice;
 
+pub use self::value::Dict;
 pub use self::value::HashableValue;
 pub use self::value::Value;
 pub use self::value::from_value;

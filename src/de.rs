@@ -1294,7 +1294,7 @@ impl<R: Read> Deserializer<R> {
                 if let Some(i) = i.to_i64() {
                     value::Value::I64(i)
                 } else {
-                    value::Value::Int(i)
+                    value::Value::Int(Box::new(i))
                 }
             }
             Value::F64(f) => value::Value::F64(f),
@@ -1335,13 +1335,15 @@ impl<R: Read> Deserializer<R> {
                 if let Some(v) = self.converted_rc.get(&id) {
                     return v.clone();
                 }
-                let mut map = BTreeMap::new();
-                for (k, v) in d.inner().iter() {
-                    if let Ok(hk) = self.de_value_to_public_value(k.clone()).into_hashable() {
-                        map.insert(hk, self.de_value_to_public_value(v.clone()));
-                    }
-                }
-                let val = value::Value::Dict(Shared::new(map));
+                let dict = d
+                    .inner()
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        let hk = self.de_value_to_public_value(k.clone()).into_hashable().ok()?;
+                        Some((hk, self.de_value_to_public_value(v.clone())))
+                    })
+                    .collect::<value::Dict>();
+                let val = value::Value::Dict(Shared::new(dict));
                 self.converted_rc.insert(id, val.clone());
                 val
             }
@@ -1638,7 +1640,7 @@ impl<R: Read> Deserializer<R> {
                 if let Some(i) = v.to_i64() {
                     Ok(value::Value::I64(i))
                 } else {
-                    Ok(value::Value::Int(v))
+                    Ok(value::Value::Int(Box::new(v)))
                 }
             }
             Value::F64(v) => Ok(value::Value::F64(v)),
@@ -1710,7 +1712,7 @@ impl<R: Read> Deserializer<R> {
                     return Ok(converted.clone());
                 }
 
-                let mut map = BTreeMap::new();
+                let mut map = value::Dict::new();
                 let v = v.inner();
                 for (key, value) in v.iter() {
                     let real_key = self

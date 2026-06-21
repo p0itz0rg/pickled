@@ -16,7 +16,6 @@ use std::cell::Ref;
 use std::cell::RefCell;
 use std::cell::RefMut;
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::rc::Rc;
@@ -251,6 +250,143 @@ where
     }
 }
 
+/// A Python dictionary: `(key, value)` entries kept **sorted by key**.
+///
+/// Backed by a flat `Vec` rather than a `BTreeMap`. Pickle dict and
+/// object-state maps are overwhelmingly tiny, and a `BTreeMap` allocates a
+/// fixed-capacity node per map regardless of how few entries it holds, so for
+/// the many small maps in a typical pickle a sorted `Vec` is several times
+/// tighter in memory. Lookups stay `O(log n)` via binary search.
+///
+/// # Invariant
+///
+/// Entries are always sorted by key (using `HashableValue`'s `Ord`) with no
+/// duplicate keys. Every constructor and mutator upholds this, so iteration
+/// yields entries in key order -- identical to the order a `BTreeMap` with the
+/// same keys would produce. `get`/`contains_key` rely on this ordering.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Dict {
+    entries: Vec<(HashableValue, Value)>,
+}
+
+impl Dict {
+    pub fn new() -> Self {
+        Dict { entries: Vec::new() }
+    }
+
+    /// Wrap an already-sorted, duplicate-free entry vector without re-checking.
+    /// The caller must guarantee the sort-by-key invariant.
+    pub fn from_sorted_unchecked(entries: Vec<(HashableValue, Value)>) -> Self {
+        debug_assert!(entries.windows(2).all(|w| w[0].0 < w[1].0), "Dict::from_sorted_unchecked given unsorted entries");
+        Dict { entries }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn position(&self, key: &HashableValue) -> std::result::Result<usize, usize> {
+        self.entries.binary_search_by(|(k, _)| k.cmp(key))
+    }
+
+    pub fn get(&self, key: &HashableValue) -> Option<&Value> {
+        self.position(key).ok().map(|i| &self.entries[i].1)
+    }
+
+    pub fn get_mut(&mut self, key: &HashableValue) -> Option<&mut Value> {
+        match self.position(key) {
+            Ok(i) => Some(&mut self.entries[i].1),
+            Err(_) => None,
+        }
+    }
+
+    pub fn contains_key(&self, key: &HashableValue) -> bool {
+        self.position(key).is_ok()
+    }
+
+    /// Insert a key/value pair, keeping entries sorted. Returns the previous
+    /// value if the key was already present.
+    pub fn insert(&mut self, key: HashableValue, value: Value) -> Option<Value> {
+        match self.position(&key) {
+            Ok(i) => Some(std::mem::replace(&mut self.entries[i].1, value)),
+            Err(i) => {
+                self.entries.insert(i, (key, value));
+                None
+            }
+        }
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = (&HashableValue, &Value)> {
+        self.entries.iter().map(|(k, v)| (k, v))
+    }
+
+    pub fn keys(&self) -> impl ExactSizeIterator<Item = &HashableValue> {
+        self.entries.iter().map(|(k, _)| k)
+    }
+
+    pub fn values(&self) -> impl ExactSizeIterator<Item = &Value> {
+        self.entries.iter().map(|(_, v)| v)
+    }
+
+    pub fn values_mut(&mut self) -> impl ExactSizeIterator<Item = &mut Value> {
+        self.entries.iter_mut().map(|(_, v)| v)
+    }
+
+    /// The backing entries as a sorted slice.
+    pub fn as_slice(&self) -> &[(HashableValue, Value)] {
+        &self.entries
+    }
+
+    pub fn into_entries(self) -> Vec<(HashableValue, Value)> {
+        self.entries
+    }
+}
+
+impl FromIterator<(HashableValue, Value)> for Dict {
+    fn from_iter<I: IntoIterator<Item = (HashableValue, Value)>>(iter: I) -> Self {
+        let mut entries: Vec<(HashableValue, Value)> = iter.into_iter().collect();
+        // Stable sort by key, then drop duplicate keys keeping the last value
+        // written (matches repeated `BTreeMap::insert`). Dedup compares with
+        // `Ord` (not `PartialEq`) so it collapses exactly the keys that sort and
+        // binary-search treat as equal -- `HashableValue`'s cross-type numeric
+        // ordering makes e.g. `Bool(true)` and `Int(1)` `Ordering::Equal`.
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries.dedup_by(|later, kept| later.0.cmp(&kept.0) == Ordering::Equal && {
+            std::mem::swap(&mut kept.1, &mut later.1);
+            true
+        });
+        Dict { entries }
+    }
+}
+
+impl IntoIterator for Dict {
+    type Item = (HashableValue, Value);
+    type IntoIter = std::vec::IntoIter<(HashableValue, Value)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a Dict {
+    type Item = (&'a HashableValue, &'a Value);
+    type IntoIter = std::iter::Map<std::slice::Iter<'a, (HashableValue, Value)>, fn(&'a (HashableValue, Value)) -> (&'a HashableValue, &'a Value)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter().map(|(k, v)| (k, v))
+    }
+}
+
+impl Extend<(HashableValue, Value)> for Dict {
+    fn extend<I: IntoIterator<Item = (HashableValue, Value)>>(&mut self, iter: I) {
+        for (k, v) in iter {
+            self.insert(k, v);
+        }
+    }
+}
+
 /// Represents all primitive builtin Python values that can be restored by
 /// unpickling.
 ///
@@ -268,7 +404,7 @@ pub enum Value {
     /// Short integer
     I64(i64),
     /// Long integer (unbounded length)
-    Int(BigInt),
+    Int(Box<BigInt>),
     /// Float
     F64(f64),
     /// Bytestring
@@ -283,8 +419,8 @@ pub enum Value {
     Set(Shared<BTreeSet<HashableValue>>),
     /// Frozen (immutable) set
     FrozenSet(SharedFrozen<BTreeSet<HashableValue>>),
-    /// Dictionary (map)
-    Dict(Shared<BTreeMap<HashableValue, Value>>),
+    /// Dictionary (map), stored as sorted entries (see [`Dict`]).
+    Dict(Shared<Dict>),
     /// Python object reconstructed during unpickling
     Object(Shared<Box<dyn PickleObject>>),
 }
@@ -316,8 +452,8 @@ impl PartialEq for Value {
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::I64(a), Value::I64(b)) => a == b,
             (Value::Int(a), Value::Int(b)) => a == b,
-            (Value::I64(a), Value::Int(b)) => BigInt::from(*a) == *b,
-            (Value::Int(a), Value::I64(b)) => *a == BigInt::from(*b),
+            (Value::I64(a), Value::Int(b)) => BigInt::from(*a) == **b,
+            (Value::Int(a), Value::I64(b)) => **a == BigInt::from(*b),
             (Value::F64(a), Value::F64(b)) => a == b,
             (Value::Bytes(a), Value::Bytes(b)) => a == b,
             (Value::String(a), Value::String(b)) => a == b,
@@ -337,7 +473,7 @@ impl PartialEq for Value {
 variant_accessors!(Value {
     tuple Bool(bool) => bool;
     tuple I64(i64) => i64;
-    tuple Int(BigInt) => int;
+    tuple Int(Box<BigInt>) => int;
     tuple F64(f64) => f64;
     tuple Bytes(SharedFrozen<Vec<u8>>) => bytes;
     tuple String(SharedFrozen<String>) => string;
@@ -345,7 +481,7 @@ variant_accessors!(Value {
     tuple Tuple(SharedFrozen<Vec<Value>>) => tuple;
     tuple Set(Shared<BTreeSet<HashableValue>>) => set;
     tuple FrozenSet(SharedFrozen<BTreeSet<HashableValue>>) => frozen_set;
-    tuple Dict(Shared<BTreeMap<HashableValue, Value>>) => dict;
+    tuple Dict(Shared<Dict>) => dict;
     tuple Object(Shared<Box<dyn PickleObject>>) => object;
     unit None => none;
 });
@@ -366,7 +502,7 @@ pub enum HashableValue {
     /// Short integer
     I64(i64),
     /// Long integer
-    Int(BigInt),
+    Int(Box<BigInt>),
     /// Float
     F64(f64),
     /// Bytestring
@@ -382,7 +518,7 @@ pub enum HashableValue {
 variant_accessors!(HashableValue {
     tuple Bool(bool) => bool;
     tuple I64(i64) => i64;
-    tuple Int(BigInt) => int;
+    tuple Int(Box<BigInt>) => int;
     tuple F64(f64) => f64;
     tuple Bytes(SharedFrozen<Vec<u8>>) => bytes;
     tuple String(SharedFrozen<String>) => string;
@@ -646,8 +782,8 @@ impl PartialEq for HashableValue {
             (Bool(a), I64(b)) => (*a as i64) == *b,
             (I64(a), Bool(b)) => *a == (*b as i64),
             (I64(a), I64(b)) => a == b,
-            (I64(a), Int(b)) => BigInt::from(*a) == *b,
-            (Int(a), I64(b)) => *a == BigInt::from(*b),
+            (I64(a), Int(b)) => BigInt::from(*a) == **b,
+            (Int(a), I64(b)) => **a == BigInt::from(*b),
             (Int(a), Int(b)) => a == b,
             // Float comparisons use IEEE 754 semantics (NaN != NaN, -0.0 == 0.0)
             (F64(a), F64(b)) => a == b,
@@ -696,7 +832,7 @@ impl Ord for HashableValue {
                 None => Ordering::Greater,
                 Bool(b2) => b.cmp(&b2),
                 I64(i2) => (b as i64).cmp(&i2),
-                Int(ref bi) => BigInt::from(b as i64).cmp(bi),
+                Int(ref bi) => BigInt::from(b as i64).cmp(bi.as_ref()),
                 F64(f) => float_ord(b as i64 as f64, f),
                 _ => Ordering::Less,
             },
@@ -704,14 +840,14 @@ impl Ord for HashableValue {
                 None => Ordering::Greater,
                 Bool(b) => i.cmp(&(b as i64)),
                 I64(i2) => i.cmp(&i2),
-                Int(ref bi) => BigInt::from(i).cmp(bi),
+                Int(ref bi) => BigInt::from(i).cmp(bi.as_ref()),
                 F64(f) => float_bigint_ord(&BigInt::from(i), f),
                 _ => Ordering::Less,
             },
             Int(ref bi) => match *other {
                 None => Ordering::Greater,
-                Bool(b) => bi.cmp(&BigInt::from(b as i64)),
-                I64(i) => bi.cmp(&BigInt::from(i)),
+                Bool(b) => bi.as_ref().cmp(&BigInt::from(b as i64)),
+                I64(i) => bi.as_ref().cmp(&BigInt::from(i)),
                 Int(ref bi2) => bi.cmp(bi2),
                 F64(f) => float_bigint_ord(bi, f),
                 _ => Ordering::Less,
@@ -874,7 +1010,7 @@ pub(crate) enum RawHashableValue {
     /// Short integer
     I64(i64),
     /// Long integer
-    Int(BigInt),
+    Int(Box<BigInt>),
     /// Float
     F64(f64),
     /// Bytestring
